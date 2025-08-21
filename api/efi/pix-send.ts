@@ -1,49 +1,64 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { efiClient } from '../../lib/efiClient.js';
+// api/efi/pix-send.ts
+import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { efiClient } from "../../lib/efiClient.js";
+import { requireBearer } from "../../lib/auth.js";
 
-function authOk(req: VercelRequest): boolean {
-  const header = req.headers['authorization'] || '';
-  const expected = `Bearer ${process.env.BRIDGE_TOKEN}`;
-  return header === expected;
+function randomIdEnvio() {
+  // 24-32 chars alfanum já é suficiente como id único
+  return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' });
-  if (!authOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  if (req.method === "GET") {
+    return res.status(200).json({ ok: true, hint: "Use POST com JSON { keyType, keyValue, amount, description }" });
+  }
+  if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
+  if (!requireBearer(req, res)) return;
 
   try {
     const { keyType, keyValue, amount, description } = req.body || {};
     if (!keyType || !keyValue || !amount) {
-      return res.status(400).json({ error: 'keyType, keyValue e amount são obrigatórios' });
+      return res.status(400).json({ error: "keyType, keyValue e amount (centavos) são obrigatórios" });
+    }
+
+    // chave do pagador: sua chave Pix da conta-mestra (que envia o dinheiro)
+    const payerKey = process.env.EFI_PAYER_PIX_KEY || process.env.EFI_RECEIVER_PIX_KEY; // use uma das que vc configurou
+    if (!payerKey) {
+      return res.status(500).json({ error: "missing_payer_key", details: "Configure EFI_PAYER_PIX_KEY nas variáveis da Vercel" });
     }
 
     const client = await efiClient();
 
-    // Envio de Pix (repasse). Para alguns PSPs, basta informar a 'chave' e 'valor'.
-    const body: any = {
-      valor: (Number(amount) / 100).toFixed(2),
-      chave: String(keyValue),
-      descricao: description ? String(description).slice(0, 100) : 'Repasse AssinaPix'
+    // gera um id único para este envio
+    const idEnvio = randomIdEnvio();
+
+    // Body conforme doc "Requisitar envio de Pix"
+    const body = {
+      valor: (amount / 100).toFixed(2),
+      pagador: {
+        chave: payerKey,
+        infoPagador: description || "Repasse AssinaPix"
+      },
+      favorecido: {
+        // a Efí identifica o tipo de chave automaticamente (email, cpf, cnpj, telefone, evp)
+        chave: keyValue
+      }
     };
 
-    // Idempotency-Key ajuda a não duplicar envios acidentais
-    const idempotency = `repasse-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    const sendResp = await client.post('/v2/pix', body, {
-      headers: { 'Idempotency-Key': idempotency }
-    });
-
-    // Alguns PSPs retornam endToEndId (e2eid) ou algo similar
-    const endToEndId = sendResp.data?.endToEndId || sendResp.data?.e2eid || null;
+    // Preferir v3; se seu app ainda não tiver, pode trocar para /v2/gn/pix/
+    const url = `/v3/gn/pix/${idEnvio}`;
+    const sendResp = await client.put(url, body);
 
     return res.status(200).json({
-      endToEndId,
-      status: 'SUBMITTED',
+      idEnvio,
+      e2eId: sendResp.data?.e2eId || null,
+      valor: sendResp.data?.valor,
+      status: sendResp.data?.status || "EM_PROCESSAMENTO",
+      horario: sendResp.data?.horario,
       raw: sendResp.data
     });
   } catch (err: any) {
-    const details = err?.response?.data || err?.message || String(err);
-    if (process.env.DEBUG_LOG) console.error('[efi/pix-send] error:', details);
-    return res.status(500).json({ error: 'efi_pix_send_failed', details });
+    console.error(err?.response?.data || err);
+    return res.status(500).json({ error: "efi_pix_send_failed", details: err?.response?.data || err?.message });
   }
 }
