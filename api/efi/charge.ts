@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { efiClient } from '../../lib/efiClient';
+import { efiClient } from '../../lib/efiClient.js';
 
 function authOk(req: VercelRequest): boolean {
   const header = req.headers['authorization'] || '';
