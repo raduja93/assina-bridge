@@ -1,26 +1,20 @@
-// antes do api.post:
-console.log("EFI_REC path=", PATH);
-console.log("EFI_REC payload=", JSON.stringify(bodyEfi));
-
-
-
-
 // api/efi/rec.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { efi } from "../../lib/efiClient"; // axios com mTLS + OAuth
+import { efi } from "../../lib/efiClient"; // seu axios com mTLS + OAuth2
 
 // ============================
-// C O R S
+// C O R S  (dev vs prod)
 // ============================
-// DEV: aceita previews Lovable. PROD: troque para domínios fixos (ex.: https://app.assinapix.com)
+// DEV: aceita previews/sandbox do Lovable e o vercel do manager.
+// PROD: troque para aceitar apenas seus domínios (ex.: https://app.assinapix.com).
 function setCors(req: VercelRequest, res: VercelResponse) {
   const origin = (req.headers.origin as string) || "";
 
   if (
-    origin.endsWith(".lovable.app") ||                 // dev
-    origin.endsWith(".sandbox.lovable.dev") ||         // dev
-    origin === "https://assinapix-manager.vercel.app"  // opcional
-    // origin === "https://app.assinapix.com"          // PROD (descomente quando migrar)
+    origin.endsWith(".lovable.app") ||             // dev preview
+    origin.endsWith(".sandbox.lovable.dev") ||     // dev sandbox
+    origin === "https://assinapix-manager.vercel.app" // opcional (se usar)
+    // origin === "https://app.assinapix.com"      // PROD: habilite aqui e remova os de cima
   ) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
@@ -45,22 +39,25 @@ function mapPeriodicity(p: unknown) {
   const v = String(p || "").toLowerCase();
   if (["mensal", "monthly", "mes"].includes(v)) return "MENSAL";
   if (["semanal", "weekly", "semana"].includes(v)) return "SEMANAL";
-  if (["anual", "annual", "ano"].includes(v)) return "ANUAL";
+  if (["anual", "annual", "ano"].includes(v))   return "ANUAL";
   if (["diario", "diária", "daily", "dia"].includes(v)) return "DIARIO";
-  // fallback seguro
-  return String(p || "MENSAL").toUpperCase();
+  return String(p || "MENSAL").toUpperCase(); // fallback seguro
 }
 function todayYMD() {
   return new Date().toISOString().slice(0, 10);
+}
+
+function isEfiRoot(b: any) {
+  return b && typeof b === "object" && b.vinculo && b.calendario && b.valor;
 }
 function isEfiWrapped(b: any) {
   return b && typeof b === "object" && b.rec && typeof b.rec === "object";
 }
 
-// converte o payload LEGADO (do app) -> body do /v2/rec EMBRULHADO em { rec: {...} }
+// Converte o payload LEGADO do app -> formato esperado pela Efí (sem wrapper)
 function toEfiFromLegacy(input: any) {
   const nome = input?.subscriber?.name || "";
-  const cpf = onlyDigits(input?.subscriber?.cpf);
+  const cpf  = onlyDigits(input?.subscriber?.cpf);
   const amount = input?.amount_cents;
   const periodicity = input?.periodicity;
 
@@ -78,20 +75,18 @@ function toEfiFromLegacy(input: any) {
   const objeto = input?.description || "Assinatura recorrente";
 
   return {
-    rec: {
-      vinculo: {
-        ...(input?.planId ? { contrato: input.planId } : {}),
-        devedor: { cpf, nome },
-        objeto,
-      },
-      calendario: {
-        dataInicial,
-        periodicidade: mapPeriodicity(periodicity),
-        // opcional: dataFinal
-      },
-      valor: { valorRec },
-      // opcional: politicaRetentativa, ativacao, etc.
+    vinculo: {
+      ...(input?.planId ? { contrato: input.planId } : {}),
+      devedor: { cpf, nome },
+      objeto,
     },
+    calendario: {
+      dataInicial,
+      periodicidade: mapPeriodicity(periodicity),
+      // opcional: dataFinal
+    },
+    valor: { valorRec },
+    // opcional: politicaRetentativa, loc, ativacao...
   };
 }
 
@@ -110,13 +105,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const input = (req.body || {}) as any;
 
-    // 1) Aceita formato EFI (wrapped) OU converte do LEGADO
-    const bodyEfi = isEfiWrapped(input) ? input : toEfiFromLegacy(input);
+    // 1) Normalização da entrada:
+    //    - Se já vier no formato Efí (raiz): usa direto
+    //    - Se vier com wrapper { rec: {...} }: desembrulha
+    //    - Caso contrário, converte do formato legado do app
+    let payload: any;
+    if (isEfiRoot(input)) {
+      payload = input;
+    } else if (isEfiWrapped(input)) {
+      payload = input.rec;
+    } else {
+      payload = toEfiFromLegacy(input);
+    }
 
     // 2) Chama Efí
     const api = await efi();
     // api.defaults.headers.common["Accept-Encoding"] = "identity"; // debug opcional
-    const resp = await api.post(PATH, bodyEfi);
+    const resp = await api.post(PATH, payload);
 
     setCors(req, res);
     return res.status(200).json({ ok: true, data: resp.data });
@@ -128,3 +133,4 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(status).json({ ok: false, error: "efi_rec_create_fail", detail });
   }
 }
+
