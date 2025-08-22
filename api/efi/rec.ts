@@ -1,6 +1,6 @@
 // api/efi/rec.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { efi } from "../../lib/efiClient"; // seu cliente mTLS + OAuth (axios instance)
+import { efi } from "../../lib/efiClient"; // cliente axios com mTLS + OAuth
 
 // ============================
 // C O R S  (Lovable + seus domínios)
@@ -26,6 +26,67 @@ function setCors(req: VercelRequest, res: VercelResponse) {
 }
 
 // ============================
+// U T I L S
+// ============================
+function moneyFromCents(cents: unknown): string {
+  const n = Number(cents || 0);
+  return (n / 100).toFixed(2); // "30.00"
+}
+
+function normalizeCPF(raw: unknown): string {
+  return String(raw || "").replace(/\D/g, "").slice(0, 11);
+}
+
+function normalizePeriodicity(raw: unknown): string {
+  const v = String(raw || "").trim().toLowerCase();
+  // mapeia os comuns do seu app → Efí (ajuste se necessário)
+  if (["mensal", "monthly", "mes"].includes(v)) return "MENSAL";
+  if (["semanal", "weekly", "semana"].includes(v)) return "SEMANAL";
+  if (["anual", "annual", "ano"].includes(v)) return "ANUAL";
+  if (["diario", "diária", "daily", "dia"].includes(v)) return "DIARIO";
+  // fallback seguro
+  return String(raw || "MENSAL").toUpperCase();
+}
+
+// monta o body esperado pelo POST /v2/rec (Pix Automático)
+function toEfiRecurrenceBody(input: any) {
+  // permite override total (caso você queira enviar o body pronto do frontend)
+  if (input?.efiOverride && typeof input.efiOverride === "object") {
+    return input.efiOverride;
+  }
+
+  const nome = input?.subscriber?.name || "";
+  const cpf = normalizeCPF(input?.subscriber?.cpf);
+  const periodicidade = normalizePeriodicity(input?.periodicity);
+  const valorRec = moneyFromCents(input?.amount_cents);
+  const objeto = input?.description || "Assinatura recorrente";
+
+  // dataInicial: hoje (YYYY-MM-DD). Se vier do frontend, respeita.
+  const dataInicial =
+    input?.start_date ||
+    new Date().toISOString().slice(0, 10);
+
+  const body: any = {
+    vinculo: {
+      // use o planId como "contrato" para rastrear de qual plano veio
+      ...(input?.planId ? { contrato: input.planId } : {}),
+      devedor: { cpf, nome },
+      objeto
+    },
+    calendario: {
+      dataInicial,
+      periodicidade // "MENSAL" | "SEMANAL" | "ANUAL" | "DIARIO" (ajuste conforme produto contratado)
+      // opcional: dataFinal
+      // ...(input?.end_date ? { dataFinal: input.end_date } : {})
+    },
+    valor: { valorRec } // string com 2 casas decimais
+    // opcional: politicaRetentativa, ativacao, etc. — inclua aqui se o seu produto exigir
+  };
+
+  return body;
+}
+
+// ============================
 // H A N D L E R
 // ============================
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -34,89 +95,50 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
-    // ----------------------------
-    // 1) Validação de entrada básica (para UX melhor)
-    //    -> mantemos flexível: se você for usar /cob/{txid}, exigimos 'txid'
-    //    -> se usar EFI_REC_CREATE_PATH (POST custom), passamos o body "as is"
-    // ----------------------------
+    // 1) validação mínima do payload do app (campos que você já coleta)
     const body = req.body as any;
-
-    // variáveis de modo/config
-    const REC_CREATE_PATH = (process.env.EFI_REC_CREATE_PATH || "").trim(); // ex.: "/v2/solicrec"
-    const USE_COB_PUT = process.env.EFI_COB_PUT === "1";                    // quando quiser PUT /cob/{txid}
-
-    if (!REC_CREATE_PATH && !USE_COB_PUT) {
+    const sub = body?.subscriber || {};
+    if (!sub?.name || !sub?.cpf || !body?.amount_cents || !body?.periodicity) {
       setCors(req, res);
-      return res.status(501).json({
+      return res.status(400).json({
         ok: false,
-        error: "not_configured",
-        detail:
-          "Defina EFI_REC_CREATE_PATH (POST custom) ou EFI_COB_PUT=1 (PUT /cob/{txid}) nas variáveis de ambiente.",
+        error: "missing_fields",
+        need: ["subscriber.name", "subscriber.cpf", "amount_cents", "periodicity"],
       });
     }
 
-    // validações por modo
-    if (USE_COB_PUT) {
-      if (!body?.txid) {
-        setCors(req, res);
-        return res.status(400).json({
-          ok: false,
-          error: "missing_txid",
-          need: ["txid"],
-          note: "Para usar PUT /cob/{txid}, forneça 'txid' no body e o payload EXATO que a Efí exige.",
-        });
-      }
-      // OBS: o restante do body deve ser exatamente o JSON do /cob (doc oficial Efí)
-    } else {
-      if (!REC_CREATE_PATH.startsWith("/")) {
-        setCors(req, res);
-        return res.status(400).json({
-          ok: false,
-          error: "bad_path",
-          detail: "EFI_REC_CREATE_PATH deve começar com '/'. Ex.: /v2/solicrec",
-        });
-      }
-      // aqui não validamos campos: assumimos que você envia EXATAMENTE o JSON da collection Efí
+    // 2) monta o payload do /v2/rec exatamente como a Efí espera
+    const efiBody = toEfiRecurrenceBody(body);
+
+    // 3) endpoint da Efí (permite override por ENV; default = /v2/rec)
+    const path = (process.env.EFI_REC_CREATE_PATH || "/v2/rec").trim();
+    if (!path.startsWith("/")) {
+      setCors(req, res);
+      return res.status(500).json({
+        ok: false,
+        error: "bad_env",
+        detail: "EFI_REC_CREATE_PATH deve começar com '/'. Ex.: /v2/rec",
+      });
     }
 
-    // ----------------------------
-    // 2) Chamada à Efí (mTLS + OAuth via efi())
-    // ----------------------------
+    // 4) chama a Efí (mTLS + OAuth via efi())
     const api = await efi();
-
-    // Alguns ambientes exigem desabilitar compressão pra debug de Content-Length
-    // Descomente se precisar:
+    // se precisar depurar Content-Length, descomente:
     // api.defaults.headers.common["Accept-Encoding"] = "identity";
 
-    let url = "";
-    let method: "post" | "put" = "post";
-    let data: any = body;
+    const resp = await api.post(path, efiBody);
 
-    if (USE_COB_PUT) {
-      url = `/cob/${encodeURIComponent(body.txid)}`;
-      method = "put";
-      // 'data' = body exato exigido pela Efí para /cob (EX: { calendario, valor, chave, ... })
-    } else {
-      url = REC_CREATE_PATH; // EX: "/v2/solicrec" ou outro endpoint de Pix Automático
-      method = "post";
-      // 'data' = body exato exigido pela Efí para esse endpoint
-    }
-
-    const resp = await api.request({ url, method, data });
+    // 5) devolve para o frontend
     setCors(req, res);
-    return res.status(200).json({ ok: true, data: resp.data });
-
+    return res.status(200).json({
+      ok: true,
+      data: resp.data, // geralmente inclui idRec, status, dados de ativação/loc etc.
+    });
   } catch (err: any) {
-    // loga o erro detalhado no server (Vercel Logs)
     const status = err?.response?.status || 500;
     const detail = err?.response?.data || { message: err?.message || "unknown_error" };
     console.error("efi_rec_error", status, detail);
-
     setCors(req, res);
-    return res.status(status).json({
-      ok: false,
-      error: "efi_rec_create_fail",
-      detail,
-    });
+    return res.status(status).json({ ok: false, error: "efi_rec_create_fail", detail });
   }
 }
