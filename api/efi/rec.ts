@@ -1,17 +1,23 @@
 // api/efi/rec.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-// 1) CORS — libere apenas o seu frontend (defina ALLOWED_ORIGIN na Vercel)
-const ALLOWED_ORIGIN =
-  process.env.ALLOWED_ORIGIN || "https://assinapix-manager.vercel.app";
-
-function setCors(res: VercelResponse) {
-  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+// ---- CORS (múltiplas origens) ----
+function parseAllowedOrigins(): string[] {
+  const raw = process.env.ALLOWED_ORIGINS || "";
+  return raw.split(",").map(s => s.trim()).filter(Boolean);
+}
+function setCors(req: VercelRequest, res: VercelResponse) {
+  const allowed = parseAllowedOrigins();
+  const origin = (req.headers.origin as string) || "";
+  // Em dev, você pode liberar tudo. Em produção, mantenha lista.
+  const isDev = process.env.NODE_ENV !== "production";
+  const allow = allowed.includes(origin) ? origin : (isDev ? origin || "*" : "");
+  if (allow) res.setHeader("Access-Control-Allow-Origin", allow);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
-
+// -----------------------------------
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // 2) responde o preflight do navegador
   setCors(res);
