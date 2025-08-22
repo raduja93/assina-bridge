@@ -7,18 +7,25 @@ function parseAllowedOrigins(): string[] {
   return raw.split(",").map(s => s.trim()).filter(Boolean);
 }
 function setCors(req: VercelRequest, res: VercelResponse) {
-  const allowed = parseAllowedOrigins();
   const origin = (req.headers.origin as string) || "";
-  const isDev = process.env.NODE_ENV !== "production";
 
-  // se estiver em dev, libera qualquer origin que chegar
-  const allow = allowed.includes(origin) ? origin : (isDev ? origin || "*" : "");
-  if (allow) res.setHeader("Access-Control-Allow-Origin", allow);
+  // se for sandbox do lovable, libera
+  if (origin.endsWith(".sandbox.lovable.dev")) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  // se for produção, só aceita domínios fixos
+  else if (
+    origin === "https://assinapix-manager.vercel.app" ||
+    origin === "https://app.assinapix.com.br" // coloque aqui seu domínio final
+  ) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
 
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
+
 // --------------------------------------
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
