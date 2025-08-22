@@ -1,3 +1,10 @@
+// antes do api.post:
+console.log("EFI_REC path=", PATH);
+console.log("EFI_REC payload=", JSON.stringify(bodyEfi));
+
+
+
+
 // api/efi/rec.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { efi } from "../../lib/efiClient"; // axios com mTLS + OAuth
