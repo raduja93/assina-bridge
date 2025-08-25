@@ -24,6 +24,54 @@ const COBR_BASE = (process.env.EFI_COBR_BASE || "/v2/cobr").trim();
 const txidOk = (s?: string) => !!s && /^[A-Za-z0-9]{26,35}$/.test(String(s));
 const onlyDigits = (s: unknown) => String(s ?? "").replace(/\D/g, "");
 
+/** Normaliza entrada: aceita formato root ou wrapper {cobr:{...}} */
+function normalizeInput(body: any) {
+  const root = body || {};
+  const inner = root?.cobr ?? root;
+
+  // idRec pode vir no root ou dentro de cobr
+  const idRec = String(root.idRec ?? inner.idRec ?? "").trim();
+
+  // valor.original pode vir em ambos
+  const original = String(
+    inner?.valor?.original ?? root?.valor?.original ?? ""
+  ).trim();
+
+  // devedor (nome opcional)
+  const devedorCpf = onlyDigits(inner?.devedor?.cpf ?? root?.devedor?.cpf);
+  const devedorNome = String(
+    inner?.devedor?.nome ?? root?.devedor?.nome ?? ""
+  ).trim();
+
+  // calendario.dataDeVencimento
+  const dataDeVencimento = String(
+    inner?.calendario?.dataDeVencimento ?? root?.calendario?.dataDeVencimento ?? ""
+  ).trim();
+
+  const solicitacaoPagador = String(
+    inner?.solicitacaoPagador ?? root?.solicitacaoPagador ?? ""
+  ).trim();
+
+  const multa = inner?.multa ?? root?.multa;
+  const juros = inner?.juros ?? root?.juros;
+  const abatimento = inner?.abatimento ?? root?.abatimento;
+  const desconto = inner?.desconto ?? root?.desconto;
+
+  return {
+    idRec,
+    valor: original ? { original } : undefined,
+    devedor: devedorCpf
+      ? { cpf: devedorCpf, ...(devedorNome ? { nome: devedorNome } : {}) }
+      : undefined,
+    calendario: dataDeVencimento ? { dataDeVencimento } : undefined,
+    solicitacaoPagador: solicitacaoPagador || undefined,
+    multa,
+    juros,
+    abatimento,
+    desconto,
+  };
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -32,18 +80,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    // Aceita body em ambos PUT/POST (POST útil p/ clients que não conseguem PUT)
-    const {
-      txid,
-      idRec,                                  // << vínculo com a recorrência
-      valor,                                  // { original: "55.00" }
-      devedor,                                // { cpf: "..." , nome: "..." }
-      calendario,                             // { dataDeVencimento: "YYYY-MM-DD" }
-      solicitacaoPagador,                     // opcional
-      multa, juros, abatimento, desconto      // opcionais
-    } = (req.body || {}) as any;
+    const body = (req.body || {}) as any;
 
-    // ---- validações mínimas
+    // txid usado no path do PUT /v2/cobr/{txid}
+    const txid = String(body.txid ?? "").trim();
     if (!txidOk(txid)) {
       return res.status(400).json({
         ok: false,
@@ -51,62 +91,60 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         hint: "txid deve ser A–Z a–z 0–9, com 26–35 caracteres",
       });
     }
-    if (!idRec) return res.status(400).json({ ok: false, error: "missing_idRec" });
 
-    const original = valor?.original;
-    if (!original) return res.status(400).json({ ok: false, error: "missing_valor_original" });
+    // normaliza campos aceitando root ou wrapper {cobr:{...}}
+    const norm = normalizeInput(body);
 
-    const cpf = onlyDigits(devedor?.cpf);
-    const nome = (devedor?.nome || "").trim();
-    if (!cpf || !nome) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_devedor",
-        need: ["devedor.cpf", "devedor.nome"],
-      });
+    // validações mínimas
+    if (!norm.idRec) {
+      return res.status(400).json({ ok: false, error: "missing_idRec" });
     }
-
-    const dataDeVencimento = calendario?.dataDeVencimento;
-    if (!dataDeVencimento) {
+    if (!norm.valor?.original) {
+      return res.status(400).json({ ok: false, error: "missing_valor_original" });
+    }
+    if (!norm.calendario?.dataDeVencimento) {
       return res.status(400).json({
         ok: false,
         error: "missing_dataDeVencimento",
-        hint: "Use YYYY-MM-DD",
+        hint: "Use YYYY-MM-DD"
+      });
+    }
+    if (!norm.devedor?.cpf) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_devedor",
+        need: ["devedor.cpf"],
+        hint: "devedor.nome é opcional; cpf é obrigatório"
       });
     }
 
-    // ---- monta payload COBR (Pix Automático)
-    // Observação: para COBR a Efí não exige 'chave' (diferente de COB).
-    // O vínculo com a recorrência é feito por 'idRec'.
+    // payload final SEMPRE com wrapper { cobr: {...} } para a Efí
     const payload: any = {
-      idRec: String(idRec),
-      valor: { original: String(original) },
-      devedor: { cpf: String(cpf), nome: String(nome) },
-      calendario: { dataDeVencimento: String(dataDeVencimento) },
-      ...(solicitacaoPagador ? { solicitacaoPagador: String(solicitacaoPagador) } : {}),
-      ...(multa ? { multa } : {}),
-      ...(juros ? { juros } : {}),
-      ...(abatimento ? { abatimento } : {}),
-      ...(desconto ? { desconto } : {}),
+      cobr: {
+        idRec: norm.idRec,
+        valor: norm.valor,
+        devedor: norm.devedor, // nome opcional
+        calendario: norm.calendario,
+        ...(norm.solicitacaoPagador ? { solicitacaoPagador: norm.solicitacaoPagador } : {}),
+        ...(norm.multa ? { multa: norm.multa } : {}),
+        ...(norm.juros ? { juros: norm.juros } : {}),
+        ...(norm.abatimento ? { abatimento: norm.abatimento } : {}),
+        ...(norm.desconto ? { desconto: norm.desconto } : {}),
+      },
     };
 
     const api = await efi();
-
-    // upsert por txid
-    const url = `${COBR_BASE}/${encodeURIComponent(String(txid))}`;
+    const url = `${COBR_BASE}/${encodeURIComponent(txid)}`; // PUT /v2/cobr/{txid}
     const r = await api.put(url, payload);
     const d = r.data || {};
 
-    // Normaliza retorno útil
-    const copiaECola =
-      d?.pixCopiaECola ?? d?.dadosQR?.pixCopiaECola ?? null;
-    const location =
-      d?.loc?.location ?? d?.location ?? null;
+    const copiaECola = d?.pixCopiaECola ?? d?.dadosQR?.pixCopiaECola ?? null;
+    const location = d?.loc?.location ?? d?.location ?? null;
 
     return res.status(200).json({
       ok: true,
       txid: d?.txid ?? txid,
-      idRec,
+      idRec: norm.idRec,
       location,
       copiaECola,
       raw: d,
