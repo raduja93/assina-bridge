@@ -22,8 +22,6 @@ function setCors(req: VercelRequest, res: VercelResponse) {
 const COBR_BASE = (process.env.EFI_COBR_BASE || "/v2/cobr").trim();
 
 const txidOk = (s?: string) => !!s && /^[A-Za-z0-9]{26,35}$/.test(String(s));
-const onlyDigits = (s: unknown) => String(s ?? "").replace(/\D/g, "");
-const ymdOk = (s?: string) => !!s && /^\d{4}-\d{2}-\d{2}$/.test(String(s));
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
@@ -33,75 +31,75 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
+    /**
+     * Aceitamos dois formatos de body:
+     *  A) POST sem txid:
+     *     { idRec, valor:{original}, calendario:{dataDeVencimento, validadeAposVencimento?}, infoAdicional?, multa?, juros?, abatimento?, desconto? }
+     *
+     *  B) PUT com txid:
+     *     { txid, idRec, valor:{original}, calendario:{dataDeVencimento, validadeAposVencimento?}, infoAdicional?, multa?, juros?, abatimento?, desconto? }
+     *
+     * IMPORTANTE: NÃO ENVIAR "devedor" na COBR (ele já foi definido na REC).
+     */
     const body = (req.body || {}) as any;
 
-    // campos aceitos para COBR (Pix Automático)
-    const txid        = body.txid as string | undefined; // se vier -> PUT
-    const idRec       = body.idRec as string | undefined; // obrigatório nos dois modos
-    const valor       = body.valor as { original?: string } | undefined;
-    const calendario  = body.calendario as { dataDeVencimento?: string; validadeAposVencimento?: number } | undefined;
-    const devedor     = body.devedor as { cpf?: string; nome?: string } | undefined; // cpf opcional na Efí (alguns PSP pedem), nome opcional
-    const infoAdicional = body.infoAdicional as string | undefined; // opcional
+    const txid = body.txid as string | undefined;
+    const idRec = body.idRec as string | undefined;
+    const original = body?.valor?.original;
+    const dataDeVencimento = body?.calendario?.dataDeVencimento;
 
-    // validações mínimas
-    if (!idRec) return res.status(400).json({ ok:false, error:"missing_idRec" });
-    if (!valor?.original) return res.status(400).json({ ok:false, error:"missing_valor_original" });
-
-    const original = String(valor.original);
-    const dataDeVencimento = calendario?.dataDeVencimento;
-    if (!ymdOk(dataDeVencimento)) {
+    if (!idRec) {
+      return res.status(400).json({ ok: false, error: "missing_idRec" });
+    }
+    if (!original) {
+      return res.status(400).json({ ok: false, error: "missing_valor_original" });
+    }
+    if (!dataDeVencimento) {
       return res.status(400).json({
-        ok:false,
-        error:"missing_dataDeVencimento",
-        hint:"Use YYYY-MM-DD"
+        ok: false,
+        error: "missing_dataDeVencimento",
+        hint: "Use YYYY-MM-DD",
       });
     }
 
-    // devedor é opcional na Efí para COBR, mas alguns bancos exibem melhor com CPF
-    // Se vier, normaliza CPF
-    const cpf = onlyDigits(devedor?.cpf);
-    const nome = (devedor?.nome || "").trim();
-
-    // monta payload final aceito pela Efí
     const payload: any = {
       idRec: String(idRec),
-      valor: { original },
+      valor: { original: String(original) },
       calendario: {
         dataDeVencimento: String(dataDeVencimento),
-        ...(typeof calendario?.validadeAposVencimento === "number"
-          ? { validadeAposVencimento: calendario.validadeAposVencimento }
-          : {})
+        ...(body?.calendario?.validadeAposVencimento
+          ? { validadeAposVencimento: Number(body.calendario.validadeAposVencimento) }
+          : {}),
       },
-      ...(cpf ? { devedor: { cpf: String(cpf), ...(nome ? { nome } : {}) } } : {}),
-      ...(infoAdicional ? { infoAdicionais: [{ nome: "info", valor: String(infoAdicional) }] } : {})
+      ...(body?.infoAdicional ? { infoAdicional: String(body.infoAdicional) } : {}),
+      ...(body?.multa ? { multa: body.multa } : {}),
+      ...(body?.juros ? { juros: body.juros } : {}),
+      ...(body?.abatimento ? { abatimento: body.abatimento } : {}),
+      ...(body?.desconto ? { desconto: body.desconto } : {}),
     };
 
     const api = await efi();
 
-    // Se veio txid válido -> PUT /v2/cobr/:txid (você controla o txid)
-    // Caso contrário -> POST /v2/cobr (Efí gera o txid)
     let r;
-    if (txid) {
+    if (req.method === "PUT") {
+      // PUT /v2/cobr/:txid  (com txid escolhido por você)
       if (!txidOk(txid)) {
         return res.status(400).json({
-          ok:false,
-          error:"invalid_txid_format",
-          hint:"txid deve ser A–Z a–z 0–9, com 26–35 caracteres"
+          ok: false,
+          error: "invalid_txid_format",
+          hint: "txid deve ser A–Z a–z 0–9, com 26–35 caracteres",
         });
       }
-      const url = `${COBR_BASE}/${encodeURIComponent(txid)}`;
-      // PUT com payload
+      const url = `${COBR_BASE}/${encodeURIComponent(String(txid))}`;
       r = await api.put(url, payload);
     } else {
-      // POST sem txid
+      // POST /v2/cobr  (sem txid; Efí gera o txid)
       r = await api.post(COBR_BASE, payload);
     }
 
     const d = r.data || {};
-    const copiaECola =
-      d?.pixCopiaECola ?? d?.dadosQR?.pixCopiaECola ?? null;
-    const location =
-      d?.loc?.location ?? d?.location ?? null;
+    const copiaECola = d?.pixCopiaECola ?? d?.dadosQR?.pixCopiaECola ?? null;
+    const location = d?.loc?.location ?? d?.location ?? null;
 
     return res.status(200).json({
       ok: true,
@@ -109,13 +107,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       idRec,
       location,
       copiaECola,
-      raw: d
+      raw: d,
     });
-  } catch (err:any) {
+  } catch (err: any) {
     const status = err?.response?.status || 500;
     const detail = err?.response?.data || { message: err?.message || "unknown_error" };
     console.error("cobr_upsert_fail", status, detail);
     setCors(req, res);
-    return res.status(status).json({ ok:false, error:"cobr_upsert_fail", detail });
+    return res.status(status).json({ ok: false, error: "cobr_upsert_fail", detail });
   }
 }
