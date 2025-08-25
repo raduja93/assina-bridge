@@ -27,9 +27,8 @@ function setCors(req: VercelRequest, res: VercelResponse) {
 const onlyDigits = (s: unknown) => String(s ?? "").replace(/\D/g, "");
 const txidOk = (s?: string) => !!s && /^[A-Za-z0-9]{26,35}$/.test(String(s));
 const genTxid = () => {
-  // 28 chars alfanumérico
   const base = Math.random().toString(36).slice(2) + Date.now().toString(36);
-  return ("ATV" + base).replace(/[^A-Za-z0-9]/g, "").slice(0, 28);
+  return ("ATV" + base).replace(/[^A-Za-z0-9]/g, "").slice(0, 28); // 26–35
 };
 const mapPeriodicity = (p?: string) => {
   const v = String(p || "").toLowerCase();
@@ -40,9 +39,12 @@ const mapPeriodicity = (p?: string) => {
   return String(p || "MENSAL").toUpperCase();
 };
 
-// Bases/paths (podem ser override por env)
+// Bases/paths
 const COB_BASE = (process.env.EFI_COB_BASE || "/v2/cob").trim();
 const REC_BASE = (process.env.EFI_REC_CREATE_PATH || "/v2/rec").trim();
+
+// Chave Pix padrão (opcional) vinda de env
+const DEFAULT_PIX_CHAVE = (process.env.EFI_COB_CHAVE || "").trim();
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
@@ -56,8 +58,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       periodicidade,           // "MENSAL" | "SEMANAL" | ...
       dataInicial,             // "YYYY-MM-DD"
       objeto,                  // ex: "Assinatura PIX Automático"
-      contrato,                // opcional: ID do seu plano
-      txid                     // opcional: se quiser mandar o seu
+      contrato,                // opcional
+      txid,                    // opcional (você pode mandar o seu)
+      chave                    // opcional (se não mandar, usa env EFI_COB_CHAVE)
     } = (req.body || {}) as any;
 
     // -------- validações mínimas
@@ -69,34 +72,47 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!valorRec) return res.status(400).json({ ok:false, error:"missing_valorRec" });
     if (!dataInicial) return res.status(400).json({ ok:false, error:"missing_dataInicial" });
 
+    // chave Pix do recebedor é obrigatória no POST /v2/cob
+    const pixChave = (chave || DEFAULT_PIX_CHAVE).trim();
+    if (!pixChave) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_chave",
+        hint: "Envie 'chave' no body ou configure EFI_COB_CHAVE no Vercel"
+      });
+    }
+
     const per = mapPeriodicity(periodicidade);
     const obj = objeto || "Assinatura PIX Automático";
 
-    // -------- 1) cria COB imediata (pagamento agora)
-    const tx = txidOk(txid) ? txid : genTxid();
     const api = await efi();
 
+    // -------- 1) cria COB imediata (pagamento agora)
+    const tx = txidOk(txid) ? txid : genTxid();
+
+    // Em muitos PSPs, POST /v2/cob exige 'chave'
     const cobPayload = {
+      chave: pixChave,
       devedor: { cpf, nome },
       valor: { original: String(valorRec) },
       calendario: { expiracao: 3600 },
-      solicitacaoPagador: "Ativação Pix Automático (1ª parcela)",
+      solicitacaoPagador: "Ativação Pix Automático (1ª parcela)"
     };
-    // COB imediata com POST /v2/cob (sem txid)
+
     const rCob = await api.post(COB_BASE, cobPayload);
     const dataCob = rCob.data || {};
-    const txidCob = dataCob?.txid || tx; // em geral virá um txid gerado pela Efí
+    const txidCob = dataCob?.txid || tx;
 
     // -------- 2) cria REC com ativação referenciando o txid da COB
     const recPayload: any = {
       vinculo: {
         ...(contrato ? { contrato: String(contrato) } : {}),
         devedor: { cpf, nome },
-        objeto: obj,
+        objeto: obj
       },
       calendario: {
         dataInicial: String(dataInicial),
-        periodicidade: per,
+        periodicidade: per
       },
       valor: { valorRec: String(valorRec) },
       politicaRetentativa: "NAO_PERMITE",
@@ -108,7 +124,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const rRec = await api.post(REC_BASE, recPayload);
     const dataRec = rRec.data || {};
 
-    // -------- resposta consolidada pro seu front
     const copiaECola =
       dataCob?.pixCopiaECola ||
       dataCob?.dadosQR?.pixCopiaECola ||
