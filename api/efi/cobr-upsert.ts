@@ -30,22 +30,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    /**
-     * Aceitamos dois formatos (sempre com wrapper {cobr:{...}} no envio para a Efí):
-     *
-     *  A) POST /v2/cobr (sem txid — Efí gera):
-     *     Body: { idRec, valor:{original}, calendario:{dataDeVencimento, validadeAposVencimento?},
-     *             infoAdicional?, multa?, juros?, abatimento?, desconto? }
-     *
-     *  B) PUT /v2/cobr/:txid (com txid escolhido por você):
-     *     Body: { txid, idRec, valor:{original}, calendario:{dataDeVencimento, validadeAposVencimento?},
-     *             infoAdicional?, multa?, juros?, abatimento?, desconto? }
-     *
-     * IMPORTANTE: NÃO enviar "devedor" aqui (ele já foi definido na REC).
-     */
+    // Entrada “plana” (sem wrapper) – nós montamos {cobr:{...}}:
     const b = (req.body || {}) as any;
 
-    const txid = b.txid as string | undefined;              // só para PUT
+    const txid = b.txid as string | undefined; // só para PUT
     const idRec = b.idRec as string | undefined;
     const original = b?.valor?.original;
     const dataDeVencimento = b?.calendario?.dataDeVencimento;
@@ -64,7 +52,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // Monta o objeto COBR (sem devedor)
+    // Monta payload COBR (sem devedor/chave):
     const cobr: any = {
       idRec: String(idRec),
       valor: { original: String(original) },
@@ -85,7 +73,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let r;
 
     if (req.method === "PUT") {
-      // PUT /v2/cobr/:txid  (txid definido por você)
       if (!txidOk(txid)) {
         return res.status(400).json({
           ok: false,
@@ -93,11 +80,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           hint: "txid deve ser A–Z a–z 0–9, com 26–35 caracteres",
         });
       }
-      const url = `${COBR_BASE}/${encodeURIComponent(String(txid))}`;
-      r = await api.put(url, { cobr }); // <<<<<< wrapper exigido
+      r = await api.put(`${COBR_BASE}/${encodeURIComponent(String(txid))}`, { cobr });
     } else {
-      // POST /v2/cobr (sem txid — Efí gera)
-      r = await api.post(COBR_BASE, { cobr }); // <<<<<< wrapper exigido
+      r = await api.post(COBR_BASE, { cobr });
     }
 
     const d = r.data || {};
