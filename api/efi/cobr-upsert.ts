@@ -30,48 +30,59 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    // Entrada “plana” (sem wrapper) – nós montamos {cobr:{...}}:
     const b = (req.body || {}) as any;
 
-    const txid = b.txid as string | undefined; // só para PUT
-    const idRec = b.idRec as string | undefined;
-    const original = b?.valor?.original;
-    const dataDeVencimento = b?.calendario?.dataDeVencimento;
+    // Se o cliente JÁ mandou { cobr: { ... } }, use direto
+    let cobr: any | null = null;
+    let txid: string | undefined = undefined;
 
-    if (!idRec) {
-      return res.status(400).json({ ok: false, error: "missing_idRec" });
-    }
-    if (!original) {
-      return res.status(400).json({ ok: false, error: "missing_valor_original" });
-    }
-    if (!dataDeVencimento) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_dataDeVencimento",
-        hint: "Use YYYY-MM-DD",
-      });
-    }
+    if (b && typeof b === "object" && b.cobr && typeof b.cobr === "object") {
+      cobr = b.cobr;
+      txid = b.txid;
+    } else {
+      // Modo "plano": montamos o wrapper {cobr:{...}}
+      txid = b.txid;
+      const idRec = b.idRec as string | undefined;
+      const original = b?.valor?.original;
+      const dataDeVencimento = b?.calendario?.dataDeVencimento;
+      const validadeAposVencimento = b?.calendario?.validadeAposVencimento;
 
-    // Monta payload COBR (sem devedor/chave):
-    const cobr: any = {
-      idRec: String(idRec),
-      valor: { original: String(original) },
-      calendario: {
-        dataDeVencimento: String(dataDeVencimento),
-        ...(b?.calendario?.validadeAposVencimento
-          ? { validadeAposVencimento: Number(b.calendario.validadeAposVencimento) }
-          : {}),
-      },
-      ...(b?.infoAdicional ? { infoAdicional: String(b.infoAdicional) } : {}),
-      ...(b?.multa ? { multa: b.multa } : {}),
-      ...(b?.juros ? { juros: b.juros } : {}),
-      ...(b?.abatimento ? { abatimento: b.abatimento } : {}),
-      ...(b?.desconto ? { desconto: b.desconto } : {}),
-    };
+      if (!idRec) {
+        return res.status(400).json({ ok: false, error: "missing_idRec" });
+      }
+      if (!original) {
+        return res.status(400).json({ ok: false, error: "missing_valor_original" });
+      }
+      if (!dataDeVencimento) {
+        return res.status(400).json({
+          ok: false,
+          error: "missing_dataDeVencimento",
+          hint: "Use YYYY-MM-DD",
+        });
+      }
+
+      // IMPORTANTE: NÃO enviar 'devedor' na COBR (o recebedor/devedor já vem da REC)
+      cobr = {
+        idRec: String(idRec),
+        valor: { original: String(original) },
+        calendario: {
+          dataDeVencimento: String(dataDeVencimento),
+          ...(validadeAposVencimento ? { validadeAposVencimento: Number(validadeAposVencimento) } : {}),
+        },
+        ...(b?.infoAdicional ? { infoAdicional: String(b.infoAdicional) } : {}),
+        ...(b?.multa ? { multa: b.multa } : {}),
+        ...(b?.juros ? { juros: b.juros } : {}),
+        ...(b?.abatimento ? { abatimento: b.abatimento } : {}),
+        ...(b?.desconto ? { desconto: b.desconto } : {}),
+      };
+    }
 
     const api = await efi();
-    let r;
 
+    // Log de depuração
+    console.log("SENT_COBR", JSON.stringify({ method: req.method, path: COBR_BASE, hasTxid: !!txid, body: { cobr } }));
+
+    let r;
     if (req.method === "PUT") {
       if (!txidOk(txid)) {
         return res.status(400).json({
@@ -92,7 +103,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).json({
       ok: true,
       txid: d?.txid ?? (txid || null),
-      idRec,
+      idRec: (cobr?.idRec ?? null),
       location,
       copiaECola,
       raw: d,
