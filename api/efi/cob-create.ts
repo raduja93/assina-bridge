@@ -8,9 +8,12 @@ function setCors(req: VercelRequest, res: VercelResponse) {
   if (
     o.endsWith(".lovable.app") ||
     o.endsWith(".sandbox.lovable.dev") ||
-    o === "https://assinapix-manager.vercel.app"
-    // o === "https://app.assinapix.com"
-  ) res.setHeader("Access-Control-Allow-Origin", o);
+    o === "https://assinapix-manager.vercel.app" ||
+    o === "https://assinapix.com" ||              // permite domínio raiz
+    o.endsWith(".assinapix.com")                  // permite subdomínios (ex: https://app.assinapix.com)
+  ) {
+    res.setHeader("Access-Control-Allow-Origin", o);
+  }
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
