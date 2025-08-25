@@ -24,29 +24,21 @@ const COBR_BASE = (process.env.EFI_COBR_BASE || "/v2/cobr").trim();
 const txidOk = (s?: string) => !!s && /^[A-Za-z0-9]{26,35}$/.test(String(s));
 const onlyDigits = (s: unknown) => String(s ?? "").replace(/\D/g, "");
 
-/** Normaliza entrada: aceita formato root ou wrapper {cobr:{...}} */
+/** Normaliza entrada: aceita root ou wrapper {cobr:{...}} */
 function normalizeInput(body: any) {
   const root = body || {};
   const inner = root?.cobr ?? root;
 
-  // idRec pode vir no root ou dentro de cobr
   const idRec = String(root.idRec ?? inner.idRec ?? "").trim();
-
-  // valor.original pode vir em ambos
-  const original = String(
-    inner?.valor?.original ?? root?.valor?.original ?? ""
-  ).trim();
-
-  // devedor (nome opcional)
-  const devedorCpf = onlyDigits(inner?.devedor?.cpf ?? root?.devedor?.cpf);
-  const devedorNome = String(
-    inner?.devedor?.nome ?? root?.devedor?.nome ?? ""
-  ).trim();
-
-  // calendario.dataDeVencimento
+  const original = String(inner?.valor?.original ?? root?.valor?.original ?? "").trim();
   const dataDeVencimento = String(
     inner?.calendario?.dataDeVencimento ?? root?.calendario?.dataDeVencimento ?? ""
   ).trim();
+
+  // devedor é OPCIONAL na COBR; se vier, padroniza cpf e nome
+  const cpf = onlyDigits(inner?.devedor?.cpf ?? root?.devedor?.cpf);
+  const nome = String(inner?.devedor?.nome ?? root?.devedor?.nome ?? "").trim();
+  const devedor = cpf ? { cpf, ...(nome ? { nome } : {}) } : undefined;
 
   const solicitacaoPagador = String(
     inner?.solicitacaoPagador ?? root?.solicitacaoPagador ?? ""
@@ -59,11 +51,9 @@ function normalizeInput(body: any) {
 
   return {
     idRec,
-    valor: original ? { original } : undefined,
-    devedor: devedorCpf
-      ? { cpf: devedorCpf, ...(devedorNome ? { nome: devedorNome } : {}) }
-      : undefined,
-    calendario: dataDeVencimento ? { dataDeVencimento } : undefined,
+    original,
+    dataDeVencimento,
+    devedor, // opcional
     solicitacaoPagador: solicitacaoPagador || undefined,
     multa,
     juros,
@@ -82,7 +72,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const body = (req.body || {}) as any;
 
-    // txid usado no path do PUT /v2/cobr/{txid}
+    // txid (no path do PUT /v2/cobr/{txid})
     const txid = String(body.txid ?? "").trim();
     if (!txidOk(txid)) {
       return res.status(400).json({
@@ -92,46 +82,35 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // normaliza campos aceitando root ou wrapper {cobr:{...}}
     const norm = normalizeInput(body);
 
-    // validações mínimas
-    if (!norm.idRec) {
-      return res.status(400).json({ ok: false, error: "missing_idRec" });
-    }
-    if (!norm.valor?.original) {
-      return res.status(400).json({ ok: false, error: "missing_valor_original" });
-    }
-    if (!norm.calendario?.dataDeVencimento) {
+    // validações mínimas exigidas pela Efí
+    if (!norm.idRec) return res.status(400).json({ ok: false, error: "missing_idRec" });
+    if (!norm.original) return res.status(400).json({ ok: false, error: "missing_valor_original" });
+    if (!norm.dataDeVencimento) {
       return res.status(400).json({
         ok: false,
         error: "missing_dataDeVencimento",
-        hint: "Use YYYY-MM-DD"
-      });
-    }
-    if (!norm.devedor?.cpf) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_devedor",
-        need: ["devedor.cpf"],
-        hint: "devedor.nome é opcional; cpf é obrigatório"
+        hint: "Use YYYY-MM-DD",
       });
     }
 
-    // payload final SEMPRE com wrapper { cobr: {...} } para a Efí
-    const payload: any = {
-      cobr: {
-        idRec: norm.idRec,
-        valor: norm.valor,
-        devedor: norm.devedor, // nome opcional
-        calendario: norm.calendario,
-        ...(norm.solicitacaoPagador ? { solicitacaoPagador: norm.solicitacaoPagador } : {}),
-        ...(norm.multa ? { multa: norm.multa } : {}),
-        ...(norm.juros ? { juros: norm.juros } : {}),
-        ...(norm.abatimento ? { abatimento: norm.abatimento } : {}),
-        ...(norm.desconto ? { desconto: norm.desconto } : {}),
-      },
+    // monta payload SEMPRE com wrapper {cobr:{...}}
+    const cobr: any = {
+      idRec: norm.idRec,
+      valor: { original: norm.original },
+      calendario: { dataDeVencimento: norm.dataDeVencimento },
     };
+
+    // opcional: só inclui se vierem
+    if (norm.devedor) cobr.devedor = norm.devedor;
+    if (norm.solicitacaoPagador) cobr.solicitacaoPagador = norm.solicitacaoPagador;
+    if (norm.multa) cobr.multa = norm.multa;
+    if (norm.juros) cobr.juros = norm.juros;
+    if (norm.abatimento) cobr.abatimento = norm.abatimento;
+    if (norm.desconto) cobr.desconto = norm.desconto;
+
+    const payload = { cobr };
 
     const api = await efi();
     const url = `${COBR_BASE}/${encodeURIComponent(txid)}`; // PUT /v2/cobr/{txid}
