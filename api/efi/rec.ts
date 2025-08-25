@@ -2,7 +2,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { efi } from "../../lib/efiClient";
 
-// ---------------- CORS ----------------
+// ---------------- CORS --------------
 function setCors(req: VercelRequest, res: VercelResponse) {
   const o = (req.headers.origin as string) || "";
   if (
