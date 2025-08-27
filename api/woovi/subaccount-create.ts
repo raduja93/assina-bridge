@@ -6,7 +6,7 @@ import axios from "axios";
  * CONFIG
  */
 const WOOVI_BASE = (process.env.WOOVI_API_BASE || "https://api.woovi.com/api/v1").replace(/\/+$/,"");
-const WOOVI_APP_ID = process.env.WOOVI_APP_ID; // <-- obrigatória: configure no Vercel
+const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN; // <-- obrigatória: configure no Vercel
 
 /**
  * CORS (ajuste os domínios de prod quando lançar)
