@@ -2,11 +2,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import axios from "axios";
 
-/** ENV */
 const WOOVI_BASE = (process.env.WOOVI_API_BASE || "https://api.woovi.com/api/v1").replace(/\/+$/,"");
-const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN; // <-- OBRIGATÓRIO (Bearer token)
+const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN; // OBRIGATÓRIA (Bearer)
 
-/** CORS */
 function setCors(req: VercelRequest, res: VercelResponse) {
   const o = (req.headers.origin as string) || "";
   if (
@@ -34,7 +32,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    // aceita via query (GET) ou body (POST)
     const q = req.method === "GET" ? req.query : (req.body || {});
     const id = (Array.isArray(q.id) ? q.id[0] : q.id) as string | undefined; // globalID
     const correlationID = (Array.isArray(q.correlationID) ? q.correlationID[0] : q.correlationID) as string | undefined;
@@ -50,12 +47,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     let r;
     if (id) {
-      // GET /api/v1/subscriptions/{id}
+      // GET /api/v1/subscriptions/{id}  (usa o globalID retornado na criação)
       r = await axios.get(`${WOOVI_BASE}/subscriptions/${encodeURIComponent(id)}`, { headers });
     } else {
       // GET /api/v1/subscriptions?correlationID=...
-      const url = `${WOOVI_BASE}/subscriptions?correlationID=${encodeURIComponent(String(correlationID))}`;
-      r = await axios.get(url, { headers });
+      r = await axios.get(`${WOOVI_BASE}/subscriptions`, {
+        headers,
+        params: { correlationID },
+      });
     }
 
     return res.status(200).json({ ok:true, data: r.data });
