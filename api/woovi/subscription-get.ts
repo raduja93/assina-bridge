@@ -2,9 +2,11 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import axios from "axios";
 
-const WOOVI_BASE = process.env.WOOVI_API_BASE || "https://api.woovi.com/api/v1";
-const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN;
+/** ENV */
+const WOOVI_BASE = (process.env.WOOVI_API_BASE || "https://api.woovi.com/api/v1").replace(/\/+$/,"");
+const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN; // <-- OBRIGATÓRIO (Bearer token)
 
+/** CORS */
 function setCors(req: VercelRequest, res: VercelResponse) {
   const o = (req.headers.origin as string) || "";
   if (
@@ -24,32 +26,44 @@ function setCors(req: VercelRequest, res: VercelResponse) {
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
-
+  if (req.method !== "GET" && req.method !== "POST") {
+    return res.status(405).send("Method Not Allowed");
+  }
   if (!WOOVI_API_TOKEN) {
-    return res.status(500).json({ ok: false, error: "missing_WOOVI_API_TOKEN" });
+    return res.status(500).json({ ok:false, error:"missing_WOOVI_API_TOKEN" });
   }
 
   try {
+    // aceita via query (GET) ou body (POST)
     const q = req.method === "GET" ? req.query : (req.body || {});
-    const id = (q.id || q.correlationID || "").toString().trim();
+    const id = (Array.isArray(q.id) ? q.id[0] : q.id) as string | undefined; // globalID
+    const correlationID = (Array.isArray(q.correlationID) ? q.correlationID[0] : q.correlationID) as string | undefined;
 
-    if (!id) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_id",
-        hint: "passe ?id={correlationID} ou body {id:...}",
-      });
+    if (!id && !correlationID) {
+      return res.status(400).json({ ok:false, error:"missing_param", need:["id (globalID) OR correlationID"] });
     }
 
-    const r = await axios.get(`${WOOVI_BASE}/subscriptions/${encodeURIComponent(id)}`, {
-      headers: { Authorization: `Bearer ${WOOVI_API_TOKEN}` },
-    });
+    const headers = {
+      Authorization: `Bearer ${WOOVI_API_TOKEN}`,
+      "Content-Type": "application/json",
+    };
 
-    return res.status(200).json({ ok: true, data: r.data });
-  } catch (err: any) {
+    let r;
+    if (id) {
+      // GET /api/v1/subscriptions/{id}
+      r = await axios.get(`${WOOVI_BASE}/subscriptions/${encodeURIComponent(id)}`, { headers });
+    } else {
+      // GET /api/v1/subscriptions?correlationID=...
+      const url = `${WOOVI_BASE}/subscriptions?correlationID=${encodeURIComponent(String(correlationID))}`;
+      r = await axios.get(url, { headers });
+    }
+
+    return res.status(200).json({ ok:true, data: r.data });
+  } catch (err:any) {
     const status = err?.response?.status || 500;
     const detail = err?.response?.data || { message: err?.message || "unknown_error" };
     console.error("woovi_subscription_get_fail", status, detail);
-    return res.status(status).json({ ok: false, error: "woovi_subscription_get_fail", detail });
+    setCors(req, res);
+    return res.status(status).json({ ok:false, error:"woovi_subscription_get_fail", detail });
   }
 }
