@@ -4,23 +4,22 @@ import axios from "axios";
 
 /** ====== Config ====== */
 const WOOVI_BASE = (process.env.WOOVI_API_BASE || "https://api.woovi.com/api/v1").replace(/\/+$/,"");
-const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN; // (obrigatório) Bearer token
+const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN || process.env.WOOVI_APP_ID; // usa o que estiver disponível
 
-// Endereço "dummy" padrão (sobrescrevível por env JSON: WOOVI_DEFAULT_ADDRESS_JSON)
+// Endereço "dummy" padrão (pode sobrescrever via env JSON: WOOVI_DEFAULT_ADDRESS_JSON)
 const DEFAULT_ADDRESS = (() => {
-  try {
-    return JSON.parse(process.env.WOOVI_DEFAULT_ADDRESS_JSON || "{}");
-  } catch { return {}; }
+  try { return JSON.parse(process.env.WOOVI_DEFAULT_ADDRESS_JSON || "{}"); }
+  catch { return {}; }
 })() as Record<string, string>;
 
 const FALLBACK_ADDRESS: Record<string,string> = {
-  zipcode:   DEFAULT_ADDRESS.zipcode   || "01001000",
-  street:    DEFAULT_ADDRESS.street    || "Rua Teste",
-  number:    DEFAULT_ADDRESS.number    || "123",
+  zipcode:      DEFAULT_ADDRESS.zipcode      || "01001000",
+  street:       DEFAULT_ADDRESS.street       || "Rua Teste",
+  number:       DEFAULT_ADDRESS.number       || "123",
   neighborhood: DEFAULT_ADDRESS.neighborhood || "Centro",
-  city:      DEFAULT_ADDRESS.city      || "São Paulo",
-  state:     DEFAULT_ADDRESS.state     || "SP",
-  country:   DEFAULT_ADDRESS.country   || "BR",
+  city:         DEFAULT_ADDRESS.city         || "São Paulo",
+  state:        DEFAULT_ADDRESS.state        || "SP",
+  country:      DEFAULT_ADDRESS.country      || "BR",
 };
 
 /** ====== CORS ====== */
@@ -37,7 +36,7 @@ function setCors(req: VercelRequest, res: VercelResponse) {
   }
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key, X-Api-Key");
 }
 
 /** ====== Utils ====== */
@@ -55,14 +54,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST")   return res.status(405).send("Method Not Allowed");
 
   if (!WOOVI_API_TOKEN) {
-    return res.status(500).json({ ok:false, error:"missing_WOOVI_API_TOKEN" });
+    return res.status(500).json({ ok:false, error:"missing_api_token" });
   }
 
   try {
     const body = (req.body || {}) as any;
 
     // Regras mínimas
-    const businessId: string | undefined = body.businessId; // id do seu tenant (AssinaPix)
+    const businessId: string | undefined = body.businessId; // teu tenant
     const name: string | undefined       = body.name;
     const value: number | undefined      = toInt(body.value);
     const frequency: string | undefined  = body.frequency || "MONTHLY";
@@ -75,7 +74,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!name)       return res.status(400).json({ ok:false, error:"missing_name" });
     if (!value && value !== 0) return res.status(400).json({ ok:false, error:"missing_value_cents" });
 
-    // Customer mín: name + taxID (CPF/CNPJ). Woovi exige address ao criar cliente novo.
+    // Customer mínimo: name + taxID (CPF/CNPJ). Se não existir na Woovi, precisa de address → inject fallback.
     const cust = body.customer || {};
     const custName = (cust.name || "").trim();
     const taxID    = onlyDigits(cust.taxID);
@@ -83,7 +82,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ ok:false, error:"missing_customer_name_or_taxID" });
     }
 
-    // Address: se faltar, injetamos placeholder
     const addressIn = cust.address || {};
     const address = {
       zipcode:      addressIn.zipcode      || FALLBACK_ADDRESS.zipcode,
@@ -95,24 +93,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       country:      addressIn.country      || FALLBACK_ADDRESS.country,
     };
 
-    // dayGenerateCharge / dayDue
     const dayGenerate = toInt(body.dayGenerateCharge) ?? todayDayOfMonth();
     const dayDue      = toInt(body.dayDue) ?? dayGenerate;
 
-    // correlationID
     const suppliedCID: string | undefined = body.correlationID;
     const correlationID = suppliedCID || `STORE-${businessId}-${Date.now()}`;
 
-    // comment opcional
     const comment: string | undefined = body.comment;
 
-    // Monta payload para a Woovi
+    // Payload Woovi
     const payload: any = {
       name,
-      value,                           // em centavos
+      value,
       customer: {
         name: custName,
-        taxID,                         // só números
+        taxID,
         ...(cust.email ? { email: String(cust.email) } : {}),
         ...(cust.phone ? { phone: `+${onlyDigits(cust.phone)}` } : {}),
         address,
@@ -132,17 +127,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Idempotency por correlationID
     const idemKey = (req.headers["idempotency-key"] as string) || `subs-${correlationID}`;
 
-    // Chamada à Woovi
+    // CHAMADA: token cru nos dois headers (sem "Bearer")
     const r = await axios.post(
       `${WOOVI_BASE}/subscriptions`,
       payload,
       {
         headers: {
-          Authorization: `Bearer ${WOOVI_API_TOKEN}`,
+          Authorization: WOOVI_API_TOKEN as string,
+          "X-Api-Key":  WOOVI_API_TOKEN as string,
           "Content-Type": "application/json",
           "Idempotency-Key": idemKey,
         },
-        // timeout: 15000,
+        // validateStatus: () => true, // se quiser tratar manualmente
       }
     );
 
