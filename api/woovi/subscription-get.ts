@@ -1,10 +1,11 @@
 // api/woovi/subscription-get.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import axios from "axios";
+import axios, { AxiosInstance } from "axios";
 
 /** ENV */
 const WOOVI_BASE = (process.env.WOOVI_API_BASE || "https://api.woovi.com/api/v1").replace(/\/+$/, "");
-const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN; // <-- obrigatório p/ assinaturas
+const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN;   // Bearer (assinaturas)
+const WOOVI_APP_ID    = process.env.WOOVI_APP_ID;      // AppID (subconta e, em algumas contas, também consultas)
 
 /** CORS */
 function setCors(req: VercelRequest, res: VercelResponse) {
@@ -23,14 +24,28 @@ function setCors(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
+function clientBearer(): AxiosInstance | null {
+  if (!WOOVI_API_TOKEN) return null;
+  return axios.create({
+    baseURL: WOOVI_BASE,
+    headers: { Authorization: `Bearer ${WOOVI_API_TOKEN}`, "Content-Type": "application/json" },
+  });
+}
+function clientAppId(): AxiosInstance | null {
+  if (!WOOVI_APP_ID) return null;
+  return axios.create({
+    baseURL: WOOVI_BASE,
+    headers: { Authorization: WOOVI_APP_ID, "Content-Type": "application/json" },
+  });
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (!WOOVI_API_TOKEN) return res.status(500).json({ ok:false, error:"missing_WOOVI_API_TOKEN" });
+  if (req.method !== "GET" && req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
-    // Aceita via query (GET) ou body (POST) — use o que for mais prático no seu frontend
-    const q = req.method === "GET" ? req.query : req.body || {};
+    const q = req.method === "GET" ? req.query : (req.body || {});
     const correlationID = (q.correlationID || q.correlationId || "").toString().trim();
     const subscriptionId = (q.subscriptionId || q.id || "").toString().trim();
 
@@ -38,30 +53,46 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ ok:false, error:"missing_identifier", hint:"informe correlationID OU subscriptionId" });
     }
 
-    const cli = axios.create({
-      baseURL: WOOVI_BASE,
-      headers: {
-        Authorization: `Bearer ${WOOVI_API_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      // timeout: 15000,
-    });
+    const attempts: AxiosInstance[] = [];
+    const cBearer = clientBearer();
+    const cAppId  = clientAppId();
+    if (cBearer) attempts.push(cBearer);
+    if (cAppId)  attempts.push(cAppId);
 
-    let data: any;
-
-    if (subscriptionId) {
-      // caminho 1: buscar por ID direto
-      // GET /subscriptions/:id
-      const r = await cli.get(`/subscriptions/${encodeURIComponent(subscriptionId)}`);
-      data = r.data;
-    } else {
-      // caminho 2: buscar por correlationID
-      // GET /subscriptions?correlationID=...
-      const r = await cli.get(`/subscriptions`, { params: { correlationID } });
-      data = r.data;
+    if (attempts.length === 0) {
+      return res.status(500).json({
+        ok:false,
+        error:"missing_credentials",
+        hint:"Defina ao menos um: WOOVI_API_TOKEN (Bearer) ou WOOVI_APP_ID (AppID)",
+      });
     }
 
-    // Normalização amigável
+    let data: any = null;
+    let lastErr: any = null;
+
+    for (const cli of attempts) {
+      try {
+        if (subscriptionId) {
+          const r = await cli.get(`/subscriptions/${encodeURIComponent(subscriptionId)}`);
+          data = r.data;
+        } else {
+          const r = await cli.get(`/subscriptions`, { params: { correlationID } });
+          data = r.data;
+        }
+        lastErr = null;
+        break;
+      } catch (e: any) {
+        lastErr = e;
+        // segue para o próximo modo de auth
+      }
+    }
+
+    if (!data) {
+      const status = lastErr?.response?.status || 500;
+      const detail = lastErr?.response?.data || { message: lastErr?.message || "unknown_error" };
+      return res.status(status).json({ ok:false, error:"woovi_subscription_get_fail", detail });
+    }
+
     const sub = data?.subscription || data?.subscriptions?.[0] || data;
     const emv = sub?.pixRecurring?.emv || null;
     const journey = sub?.pixRecurring?.journey || null;
