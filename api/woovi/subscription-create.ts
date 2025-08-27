@@ -2,6 +2,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import axios from "axios";
 
+const WOOVI_BASE = (process.env.WOOVI_API_BASE || "https://api.woovi.com/api/v1").replace(/\/+$/,"");
+const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN || process.env.WOOVI_APP_ID;
+
 function setCors(req: VercelRequest, res: VercelResponse) {
   const o = (req.headers.origin as string) || "";
   if (
@@ -10,116 +13,76 @@ function setCors(req: VercelRequest, res: VercelResponse) {
     o === "https://assinapix-manager.vercel.app" ||
     o === "https://assinapix.com" ||
     o.endsWith(".assinapix.com")
-  ) res.setHeader("Access-Control-Allow-Origin", o);
+  ) {
+    res.setHeader("Access-Control-Allow-Origin", o);
+  }
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key, X-Api-Key");
 }
-
-const BASE = (process.env.WOOVI_BASE_URL || "https://api.woovi.com").replace(/\/+$/,"");
-const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN || "";
-
-const required = (cond: any, code: string, hint?: string) => {
-  if (!cond) {
-    const payload: any = { ok: false, error: code };
-    if (hint) payload.hint = hint;
-    const err: any = new Error(code);
-    err.status = 400;
-    err.payload = payload;
-    throw err;
-  }
-};
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST")   return res.status(405).send("Method Not Allowed");
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+
+  if (!WOOVI_API_TOKEN) {
+    return res.status(500).json({ ok: false, error: "missing_api_token" });
+  }
 
   try {
-    // Body esperado
-    const {
-      businessId,
-      name,
-      value,                   // em centavos (ex: 5500 = R$55,00)
-      customer,                // { name, taxID, email, phone, address{...} }
-      correlationID,
-      comment,
-      frequency = "MONTHLY",   // DAILY|WEEKLY|MONTHLY|YEARLY (exemplo)
-      type = "PIX_RECURRING",
-      pixRecurringOptions,     // { journey: "ONLY_RECURRENCY"|"PAYMENT_ON_APPROVAL"|"PUSH_NOTIFICATION"|"PAYMENT_WITH_OFFER_TO_RECURRENCY", retryPolicy: "NON_PERMITED"|"THREE_RETRIES_7_DAYS" }
-      dayGenerateCharge,       // número do dia do mês que gera
-      dayDue,                  // número do dia do vencimento
-      // opcional: forçar appId específico (ex: subconta)
-      appIdOverride
-    } = (req.body || {}) as any;
+    const body = req.body || {};
 
-    // Validações mínimas
-    required(API_TOKEN, "missing_api_token", "Defina WOOVI_API_TOKEN no Vercel");
-    const appId = String(appIdOverride || DEFAULT_APP_ID || "");
-    required(appId, "missing_app_id", "Defina WOOVI_APP_ID no Vercel ou envie appIdOverride no body");
-    required(name, "missing_name");
-    required(Number.isFinite(Number(value)), "missing_value", "value em centavos (ex: 5500)");
-    required(customer?.taxID, "missing_customer_taxID");
-    required(customer?.name, "missing_customer_name");
-    required(frequency, "missing_frequency");
-    required(type === "PIX_RECURRING", "type_must_be_PIX_RECURRING");
-    required(pixRecurringOptions?.journey, "missing_journey");
-    required(dayGenerateCharge, "missing_dayGenerateCharge");
-    required(dayDue, "missing_dayDue");
+    // validações mínimas
+    if (!body.businessId) {
+      return res.status(400).json({ ok: false, error: "missing_businessId" });
+    }
+    if (!body.customer?.taxID || !body.customer?.name) {
+      return res.status(400).json({ ok: false, error: "missing_customer_fields" });
+    }
+    if (!body.value) {
+      return res.status(400).json({ ok: false, error: "missing_value" });
+    }
 
-    // Monta payload conforme docs Woovi
-    const payload: any = {
-      name: String(name),
-      value: Number(value),
-      customer: {
-        name: String(customer.name),
-        taxID: String(customer.taxID),
-        ...(customer.email ? { email: String(customer.email) } : {}),
-        ...(customer.phone ? { phone: String(customer.phone) } : {}),
-        ...(customer.address ? { address: customer.address } : {})
-      },
-      ...(correlationID ? { correlationID: String(correlationID) } : {}),
-      ...(comment ? { comment: String(comment) } : {}),
-      frequency: String(frequency),
+    // payload para Woovi
+    const payload = {
+      name: body.name || "Assinatura Pix Automático",
+      value: body.value, // em centavos
+      customer: body.customer,
+      correlationID: body.correlationID || `STORE-${body.businessId}`,
+      comment: body.comment || "Assinatura via AssinaPix",
+      frequency: body.frequency || "MONTHLY",
       type: "PIX_RECURRING",
-      pixRecurringOptions: {
-        journey: String(pixRecurringOptions.journey),
-        ...(pixRecurringOptions.retryPolicy ? { retryPolicy: String(pixRecurringOptions.retryPolicy) } : {})
+      pixRecurringOptions: body.pixRecurringOptions || {
+        journey: "ONLY_RECURRENCY", // Jornada 2 como padrão
+        retryPolicy: "NON_PERMITED"
       },
-      dayGenerateCharge: Number(dayGenerateCharge),
-      dayDue: Number(dayDue),
+      dayGenerateCharge: body.dayGenerateCharge || new Date().getDate(),
+      dayDue: body.dayDue || new Date().getDate()
     };
 
-    // Cabeçalhos Woovi (App ID + Token)
-    const headers = {
-      "Content-Type": "application/json",
-      "X-APP-ID": appId,
-      Authorization: `Bearer ${API_TOKEN}`,
-    };
-
-    // Endpoint Woovi
-    const url = `${BASE}/api/v1/subscriptions`;
-
-    const r = await axios.post(url, payload, { headers });
-
-    // Normaliza resposta
-    const data = r.data || {};
-    const sub = data?.subscription || data; // algumas respostas aninham em subscription
-
-    return res.status(200).json({
-      ok: true,
-      subscriptionId: sub?.id || sub?._id || null,
-      recurrencyId: sub?.pixRecurring?.recurrencyId || null,
-      journey: sub?.pixRecurring?.journey || null,
-      status: sub?.pixRecurring?.status || sub?.status || null,
-      emv: sub?.pixRecurring?.emv || sub?.emv || null, // copia-e-cola (quando houver)
-      raw: data,
+    const r = await axios.post(`${WOOVI_BASE}/subscriptions`, payload, {
+      headers: {
+        Authorization: WOOVI_API_TOKEN,
+        "X-Api-Key": WOOVI_API_TOKEN,
+        "Content-Type": "application/json"
+      },
+      validateStatus: () => true
     });
+
+    if (r.status < 200 || r.status >= 300) {
+      return res.status(r.status).json({
+        ok: false,
+        error: "woovi_subscription_create_fail",
+        detail: r.data
+      });
+    }
+
+    return res.status(200).json({ ok: true, data: r.data });
   } catch (err: any) {
-    const status = err?.response?.status || err?.status || 500;
-    const detail = err?.response?.data || err?.payload || { message: err?.message || "unknown_error" };
+    const status = err?.response?.status || 500;
+    const detail = err?.response?.data || { message: err?.message || "unknown_error" };
     console.error("woovi_subscription_create_fail", status, detail);
-    setCors(req, res);
     return res.status(status).json({ ok: false, error: "woovi_subscription_create_fail", detail });
   }
 }
