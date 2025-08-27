@@ -4,7 +4,6 @@ import axios from "axios";
 
 const WOOVI_BASE = (process.env.WOOVI_API_BASE || "https://api.woovi.com/api/v1").replace(/\/+$/,"");
 const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN || ""; // Bearer PAT
-const WOOVI_APP_ID   = process.env.WOOVI_APP_ID   || "";   // clientId (appID)
 
 function setCors(req: VercelRequest, res: VercelResponse) {
   const o = (req.headers.origin as string) || "";
@@ -17,7 +16,7 @@ function setCors(req: VercelRequest, res: VercelResponse) {
   ) res.setHeader("Access-Control-Allow-Origin", o);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-app-id, appId, x-client-id");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -25,48 +24,35 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "GET" && req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  if (!WOOVI_API_TOKEN && !WOOVI_APP_ID) {
+  if (!WOOVI_API_TOKEN) {
     return res.status(500).json({
       ok:false,
-      error:"missing_credentials",
-      hint:"Defina WOOVI_API_TOKEN (Bearer) e WOOVI_APP_ID (clientId)"
+      error:"missing_WOOVI_API_TOKEN",
+      hint:"Defina WOOVI_API_TOKEN no Vercel"
     });
   }
 
   try {
     const q = req.method === "GET" ? req.query : (req.body || {});
-    const id = (Array.isArray(q.id) ? q.id[0] : q.id) as string | undefined;                 // globalID (ex: UGF5…)
+    const id = (Array.isArray(q.id) ? q.id[0] : q.id) as string | undefined; // globalID (base64) OU subscriptionId
     const correlationID = (Array.isArray(q.correlationID) ? q.correlationID[0] : q.correlationID) as string | undefined;
 
     if (!id && !correlationID) {
-      return res.status(400).json({ ok:false, error:"missing_param", need:["id (globalID) OR correlationID"] });
+      return res.status(400).json({ ok:false, error:"missing_param", need:["id (globalID/subscriptionId) OR correlationID"] });
     }
 
-    // Headers redundantes para cobrir variações do gateway
-    const headers: Record<string,string> = {
+    const headers = {
       "Content-Type": "application/json",
       "Accept": "application/json",
+      "Authorization": `Bearer ${WOOVI_API_TOKEN}`,
     };
-    if (WOOVI_API_TOKEN) headers.Authorization = `Bearer ${WOOVI_API_TOKEN}`;
-
-    // Envia o appId em várias chaves (algumas rotas validam nomes diferentes)
-    if (WOOVI_APP_ID) {
-      headers["x-app-id"]   = WOOVI_APP_ID;
-      headers["appId"]      = WOOVI_APP_ID;
-      headers["x-client-id"]= WOOVI_APP_ID;
-    }
-
-    // Fallback adicional: algumas integrações antigas usam Authorization sem Bearer
-    if (!WOOVI_API_TOKEN && WOOVI_APP_ID) {
-      headers.Authorization = WOOVI_APP_ID;
-    }
 
     let r;
     if (id) {
-      // GET por globalID
+      // GET /api/v1/subscriptions/{id}
       r = await axios.get(`${WOOVI_BASE}/subscriptions/${encodeURIComponent(id)}`, { headers });
     } else {
-      // GET filtrando por correlationID
+      // GET /api/v1/subscriptions?correlationID=...
       r = await axios.get(`${WOOVI_BASE}/subscriptions`, { headers, params: { correlationID } });
     }
 
