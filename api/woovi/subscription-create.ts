@@ -17,8 +17,7 @@ function setCors(req: VercelRequest, res: VercelResponse) {
 }
 
 const BASE = (process.env.WOOVI_BASE_URL || "https://api.woovi.com").replace(/\/+$/,"");
-const DEFAULT_APP_ID = process.env.WOOVI_APP_ID || "";
-const API_TOKEN = process.env.WOOVI_API_TOKEN || "";
+const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN || "";
 
 const required = (cond: any, code: string, hint?: string) => {
   if (!cond) {
