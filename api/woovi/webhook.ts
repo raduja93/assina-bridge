@@ -3,12 +3,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 
-/** ========= RAW BODY (precisa do bodyParser: false) ========= */
-export const config = {
-  api: { bodyParser: false },
-};
-
-/** ========= CORS ========= */
+/** ================= CORS ================= */
 function setCors(req: VercelRequest, res: VercelResponse) {
   const o = (req.headers.origin as string) || "";
   if (
@@ -20,132 +15,226 @@ function setCors(req: VercelRequest, res: VercelResponse) {
   ) res.setHeader("Access-Control-Allow-Origin", o);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Woovi-Signature, X-Openpix-Signature");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Woovi-Signature");
 }
 
-/** ========= Leitura do corpo cru ========= */
-async function readRaw(req: VercelRequest): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
+/** =============== HMAC helpers =============== */
+// mapear nomes de evento Woovi -> variáveis de ambiente
+const EVENT_ENV_KEYS: Record<string, string> = {
+  PIX_AUTOMATIC_APPROVED: "WOOVI_WEBHOOK_SECRET_PIX_AUTOMATIC_APPROVED",
+  PIX_AUTOMATIC_REJECTED: "WOOVI_WEBHOOK_SECRET_PIX_AUTOMATIC_REJECTED",
+  PIX_AUTOMATIC_COBR_CREATED: "WOOVI_WEBHOOK_SECRET_PIX_AUTOMATIC_COBR_CREATED",
+  PIX_AUTOMATIC_COBR_APPROVED: "WOOVI_WEBHOOK_SECRET_PIX_AUTOMATIC_COBR_APPROVED",
+  PIX_AUTOMATIC_COBR_REJECTED: "WOOVI_WEBHOOK_SECRET_PIX_AUTOMATIC_COBR_REJECTED",
+  PIX_AUTOMATIC_COBR_COMPLETED: "WOOVI_WEBHOOK_SECRET_PIX_AUTOMATIC_COBR_COMPLETED",
+  "OPENPIX:CHARGE_CREATED": "WOOVI_WEBHOOK_SECRET_OPENPIX_CHARGE_CREATED",
+  "OPENPIX:CHARGE_COMPLETED": "WOOVI_WEBHOOK_SECRET_OPENPIX_CHARGE_COMPLETED",
+  "OPENPIX:TRANSACTION_RECEIVED": "WOOVI_WEBHOOK_SECRET_OPENPIX_TRANSACTION_RECEIVED",
+};
+
+function hmacHex(secret: string, data: string) {
+  return crypto.createHmac("sha256", secret).update(data).digest("hex");
 }
 
-/** ========= HMAC ========= */
-// Mapa de segredos por evento (defina no Vercel)
-// ex.: PIX_AUTOMATIC_APPROVED -> WOOVI_HMAC_PIX_AUTOMATIC_APPROVED, etc.
-function secretForEvent(evt: string): string | undefined {
-  const key = "WOOVI_HMAC_" + evt.replace(/[^A-Z0-9_]/g, "_");
-  return process.env[key] || process.env.WOOVI_WEBHOOK_SECRET || undefined;
-}
+function validateSignature(eventType: string, raw: string, signature?: string): { ok: boolean; used: string | null } {
+  // No painel a chave aparece como "openpix_xxx=", mas a assinatura enviada vem como HEX no header.
+  // Aqui assumimos que o header `x-woovi-signature` é hex (padrão). Validamos contra:
+  // 1) segredo específico do evento (se existir), 2) fallback DEFAULT (se existir).
+  if (!signature) return { ok: false, used: null };
+  const secretsToTry: string[] = [];
 
-function isValidSignature(secret: string, rawBody: Buffer, sigHeader?: string): boolean {
-  if (!secret) return false;
-  if (!sigHeader) return false;
-  // Woovi envia Base64; calculamos em hex e comparamos em timing-safe após normalizar
-  // Alguns ambientes enviam como base64 ou hex – aceitamos ambos
-  const hmac = crypto.createHmac("sha256", secret).update(rawBody);
-  const calcHex = hmac.digest("hex");
-  const calcB64 = Buffer.from(calcHex, "hex").toString("base64");
-  const candidate = sigHeader.trim();
+  const perEventEnv = EVENT_ENV_KEYS[eventType];
+  if (perEventEnv && process.env[perEventEnv]) secretsToTry.push(process.env[perEventEnv] as string);
+  if (process.env.WOOVI_WEBHOOK_SECRET_DEFAULT) secretsToTry.push(process.env.WOOVI_WEBHOOK_SECRET_DEFAULT as string);
+
+  if (secretsToTry.length === 0) {
+    // Se você não configurou nenhum segredo, não bloqueie (apenas marque sig_ok=false)
+    return { ok: false, used: null };
+  }
 
   try {
-    const a = Buffer.from(candidate);
-    const b = Buffer.from(calcHex);
-    const c = Buffer.from(calcB64);
-    return crypto.timingSafeEqual(a, b) || crypto.timingSafeEqual(a, c);
+    const sigBuf = Buffer.from(signature, "hex");
+    for (const sec of secretsToTry) {
+      const calc = hmacHex(sec, raw);
+      const calcBuf = Buffer.from(calc, "hex");
+      if (sigBuf.length === calcBuf.length && crypto.timingSafeEqual(sigBuf, calcBuf)) {
+        return { ok: true, used: sec };
+      }
+    }
+    return { ok: false, used: null };
   } catch {
-    return candidate === calcHex || candidate === calcB64;
+    return { ok: false, used: null };
   }
 }
 
-/** ========= Supabase ========= */
-const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const supabase =
-  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    : null;
+/** =============== Supabase =============== */
+const SB_URL = process.env.SUPABASE_URL!;
+const SB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const sb = createClient(SB_URL, SB_KEY, { auth: { persistSession: false } });
 
-/** ========= Handler ========= */
+/** =============== Utils =============== */
+const onlyDigits = (s: any) => String(s ?? "").replace(/\D/g, "");
+
+function getEventType(evt: any): string {
+  return (
+    evt?.event ||
+    evt?.type ||
+    evt?.topic ||
+    "" // ex.: PIX_AUTOMATIC_APPROVED, OPENPIX:CHARGE_CREATED, etc.
+  );
+}
+
+function getCorrelationId(evt: any): string | null {
+  return (
+    evt?.correlationID ||
+    evt?.customer?.correlationID ||
+    evt?.pixRecurring?.correlationID ||
+    null
+  );
+}
+
+function deriveEventId(req: VercelRequest, evt: any, raw: string): string {
+  // tente cabeçalho/ids explícitos; se não houver, usa sha256 do corpo
+  return (
+    (req.headers["x-woovi-event-id"] as string) ||
+    evt?.eventId ||
+    evt?.id ||
+    evt?.globalID ||
+    evt?.cobr?.identifierId ||     // COBR
+    evt?.charge?.id ||             // CHARGE
+    crypto.createHash("sha256").update(raw).digest("hex")
+  );
+}
+
+/** =============== Vercel body limit =============== */
+export const config = {
+  api: { bodyParser: { sizeLimit: "1mb" } },
+};
+
+/** =============== Handler =============== */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
+  if (!SB_URL || !SB_KEY) {
+    return res.status(500).json({ ok: false, error: "missing_supabase_env" });
+  }
+
   try {
-    const raw = await readRaw(req);
-    const sig = (req.headers["x-openpix-signature"] as string) || (req.headers["x-woovi-signature"] as string) || "";
-    const json = JSON.parse(raw.toString("utf8") || "{}");
+    // No Vercel, req.body já está parseado; reconstruímos o JSON string para HMAC
+    const evt = (req.body || {}) as any;
+    const raw = JSON.stringify(evt);
+    const eventType = getEventType(evt);
+    const signature = (req.headers["x-woovi-signature"] as string) || "";
+    const { ok: sigOk } = validateSignature(eventType, raw, signature);
 
-    const eventType: string = String(json?.event || "").trim();
-    const secret = secretForEvent(eventType);
-    const sigOk = !!secret && isValidSignature(secret, raw, sig);
+    const eventId = deriveEventId(req, evt, raw);
+    const correlationID = getCorrelationId(evt);
+    const nowIso = new Date().toISOString();
 
-    // Para depuração: permitir gravar mesmo sem HMAC válido
-    const allowUnverified = String(process.env.WOOVI_ALLOW_UNVERIFIED || "").toLowerCase() === "true";
-    if (!sigOk && !allowUnverified) {
-      console.warn("webhook: invalid signature", { eventType, sigPresent: !!sig, usedSecret: !!secret });
-      return res.status(400).json({ ok: false, error: "invalid_signature", eventType });
+    // ===== 1) Persistir o webhook (idempotente por event_id) =====
+    // Requer índice único parcial (WHERE event_id IS NOT NULL) OU onConflict:event_id
+    const { error: insErr } = await sb
+      .from("woovi_webhooks")
+      .upsert(
+        {
+          event_id: eventId,
+          event_type: eventType,
+          correlation_id: correlationID,
+          payload: evt,
+          signature: signature || null,
+          sig_ok: sigOk,
+          received_at: nowIso,
+        },
+        { onConflict: "event_id" }
+      );
+
+    if (insErr) {
+      console.error("supabase insert webhook error", insErr);
+      return res.status(500).json({ ok: false, error: "db_insert_webhook_fail", detail: insErr });
     }
 
-    // Dados úteis (ajuste para seu schema)
-    const correlationID =
-      json?.correlationID ||
-      json?.data?.correlationID ||
-      json?.customer?.taxID?.taxID ||
-      json?.customer?.taxID ||
-      null;
-
-    // Gravar webhook
-    if (!supabase) {
-      console.error("Supabase credentials missing");
-    } else {
-      const insertPayload = {
-        event_type: eventType,
+    // ===== 2) Upsert em subscriptions por correlation_id =====
+    if (correlationID) {
+      const subUpdates: Record<string, any> = {
         correlation_id: correlationID,
-        signature: sig || null,
-        sig_ok: sigOk,
-        payload: json,
-        received_at: new Date().toISOString(),
+        last_event_at: nowIso,
+        last_payload: evt,
       };
-      const { error } = await supabase.from("woovi_webhooks").insert(insertPayload);
-      if (error) console.error("supabase insert webhook error", error);
+
+      // status da recorrência
+      if (evt?.pixRecurring?.status) {
+        subUpdates.status = String(evt.pixRecurring.status);
+      }
+      // recurrencyId
+      if (evt?.pixRecurring?.recurrencyId) {
+        subUpdates.pix_recurring_recurrency_id = String(evt.pixRecurring.recurrencyId);
+      }
+      // valor em centavos (alguns eventos trazem)
+      if (Number.isFinite(evt?.value)) {
+        subUpdates.value_cents = Math.trunc(Number(evt.value));
+      }
+      // client taxid (se vier)
+      const tax = onlyDigits(evt?.customer?.taxID?.taxID || evt?.customer?.taxID);
+      if (tax) subUpdates.customer_taxid = tax;
+
+      const { error: upSubErr } = await sb
+        .from("subscriptions")
+        .upsert(subUpdates, { onConflict: "correlation_id" });
+
+      if (upSubErr) console.error("subscriptions upsert error", upSubErr);
     }
 
-    // Atualizações de estado básicas (exemplo)
-    if (supabase && correlationID && typeof correlationID === "string") {
-      // Aprovação da recorrência
-      if (eventType === "PIX_AUTOMATIC_APPROVED") {
-        const recurrencyId =
-          json?.pixRecurring?.recurrencyId || json?.data?.pixRecurring?.recurrencyId || null;
-        await supabase
-          .from("subscriptions")
-          .update({ status: "ACTIVE", recurrency_id: recurrencyId, last_event_at: new Date().toISOString() })
-          .eq("correlation_id", correlationID);
-      }
+    // ===== 3) Upsert em charges (COBR / CHARGE) =====
+    // PIX_AUTOMATIC_COBR_* => evt.cobr
+    if (evt?.cobr?.installmentId || evt?.cobr?.identifierId) {
+      const installmentId = String(evt.cobr.installmentId || evt.cobr.identifierId);
+      const chargeRow: Record<string, any> = {
+        installment_id: installmentId,
+        identifier_id: evt.cobr.identifierId || null,
+        subscription_correlation_id: correlationID,
+        value_cents: Number.isFinite(evt.cobr.value) ? Math.trunc(Number(evt.cobr.value)) : null,
+        status: evt.cobr.status || null,
+        description: evt.cobr.description || null,
+        created_at_woovi: evt.cobr.createdAt || null,
+        last_event_at: nowIso,
+        last_payload: evt,
+      };
 
-      // Cobrança criada/aprovada/paga etc. (ajuste nomes/colunas da sua tabela)
-      if (eventType === "PIX_AUTOMATIC_COBR_CREATED" || eventType === "PIX_AUTOMATIC_COBR_APPROVED" || eventType === "PIX_AUTOMATIC_COBR_COMPLETED") {
-        const installmentId = json?.cobr?.installmentId || json?.data?.cobr?.installmentId || null;
-        const status = json?.cobr?.status || json?.data?.cobr?.status || null;
-        await supabase
-          .from("charges")
-          .upsert({
-            correlation_id: correlationID,
-            installment_id: installmentId,
-            woovi_status: status,
-            last_event_at: new Date().toISOString(),
-          }, { onConflict: "installment_id" });
-      }
+      const { error: upCobrErr } = await sb
+        .from("charges")
+        .upsert(chargeRow, { onConflict: "installment_id" });
+
+      if (upCobrErr) console.error("charges upsert (cobr) error", upCobrErr);
     }
 
-    // Sempre 200 para evitar re-entregas infinitas (logamos sig_ok no banco)
-    return res.status(200).json({ ok: true, accepted: true, event: eventType, sig_ok: sigOk });
-  } catch (e: any) {
-    console.error("woovi_webhook_fail", e?.message || e);
+    // OPENPIX:CHARGE_* => evt.charge (se sua conta emitir cobranças avulsas)
+    if (evt?.charge?.id) {
+      const chargeId = String(evt.charge.id);
+      const chargeRow: Record<string, any> = {
+        installment_id: chargeId, // reutilizamos a coluna como PK lógico
+        identifier_id: evt.charge.identifier || null,
+        subscription_correlation_id: correlationID,
+        value_cents: Number.isFinite(evt.charge.value) ? Math.trunc(Number(evt.charge.value)) : null,
+        status: evt.charge.status || null,
+        description: evt.charge.comment || evt.charge.description || null,
+        created_at_woovi: evt.charge.createdAt || null,
+        last_event_at: nowIso,
+        last_payload: evt,
+      };
+
+      const { error: upChgErr } = await sb
+        .from("charges")
+        .upsert(chargeRow, { onConflict: "installment_id" });
+
+      if (upChgErr) console.error("charges upsert (charge) error", upChgErr);
+    }
+
+    // ===== 4) Fim =====
+    return res.status(200).json({ ok: true });
+  } catch (err: any) {
+    console.error("woovi_webhook_fail", err?.response?.data || err?.message || err);
     return res.status(500).json({ ok: false, error: "woovi_webhook_fail" });
   }
 }
