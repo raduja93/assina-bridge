@@ -2,7 +2,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import crypto from "crypto";
 
-/** ===== CORS ===== */
+/* ========== CORS ========== */
 function setCors(req: VercelRequest, res: VercelResponse) {
   const o = (req.headers.origin as string) || "";
   if (
@@ -14,19 +14,30 @@ function setCors(req: VercelRequest, res: VercelResponse) {
   ) res.setHeader("Access-Control-Allow-Origin", o);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Woovi-Signature, X-Openpix-Signature");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Woovi-Signature");
 }
 
-/** ===== ENV ===== */
-const WEBHOOK_SECRET = process.env.WOOVI_WEBHOOK_SECRET || "";
+/* ========== Mapa de segredos por evento ========== */
+/** Configure no Vercel as ENV abaixo (valores fornecidos por você). */
+const SECRET_BY_EVENT: Record<string, string | undefined> = {
+  // Pix Automático (BCB)
+  "PIX_AUTOMATIC_APPROVED":        process.env.WOOVI_WH_SECRET_PIX_AUTOMATIC_APPROVED,
+  "PIX_AUTOMATIC_REJECTED":        process.env.WOOVI_WH_SECRET_PIX_AUTOMATIC_REJECTED,
+  "PIX_AUTOMATIC_COBR_CREATED":    process.env.WOOVI_WH_SECRET_PIX_AUTOMATIC_COBR_CREATED,
+  "PIX_AUTOMATIC_COBR_APPROVED":   process.env.WOOVI_WH_SECRET_PIX_AUTOMATIC_COBR_APPROVED,
+  "PIX_AUTOMATIC_COBR_REJECTED":   process.env.WOOVI_WH_SECRET_PIX_AUTOMATIC_COBR_REJECTED,
+  "PIX_AUTOMATIC_COBR_COMPLETED":  process.env.WOOVI_WH_SECRET_PIX_AUTOMATIC_COBR_COMPLETED,
 
-/** ===== Helpers ===== */
-async function readRawBody(req: VercelRequest): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(typeof c === "string" ? Buffer.from(c) : c);
-  return Buffer.concat(chunks);
+  // OpenPix (cobranças avulsas / transações)
+  "OPENPIX:CHARGE_CREATED":        process.env.WOOVI_WH_SECRET_OPENPIX_CHARGE_CREATED,
+  "OPENPIX:CHARGE_COMPLETED":      process.env.WOOVI_WH_SECRET_OPENPIX_CHARGE_COMPLETED,
+  "OPENPIX:TRANSACTION_RECEIVED":  process.env.WOOVI_WH_SECRET_OPENPIX_TRANSACTION_RECEIVED,
+};
+
+/* ========== Utils ========== */
+function sign(body: string, secret: string) {
+  return crypto.createHmac("sha256", secret).update(body).digest("hex");
 }
-
 function safeEqual(a: string, b: string) {
   const A = Buffer.from(a);
   const B = Buffer.from(b);
@@ -34,26 +45,9 @@ function safeEqual(a: string, b: string) {
   return crypto.timingSafeEqual(A, B);
 }
 
-function normalizeSig(s?: string) {
-  if (!s) return "";
-  // remove prefixos tipo "sha256=..."
-  const i = s.indexOf("=");
-  return i > -1 ? s.slice(i + 1).trim() : s.trim();
-}
-
-function computeHmac(raw: Buffer, secret: string) {
-  const h = crypto.createHmac("sha256", secret).update(raw);
-  return {
-    hex: h.digest("hex"),
-    // para comparar também em base64 quando o provedor enviar assim
-    base64: crypto.createHmac("sha256", secret).update(raw).digest("base64"),
-  };
-}
-
+/** Dica: aumente o limit se precisar de payloads maiores */
 export const config = {
-  api: {
-    bodyParser: false, // IMPORTANTÍSSIMO: queremos o raw body
-  },
+  api: { bodyParser: { sizeLimit: "1mb" } },
 };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -62,60 +56,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST")   return res.status(405).send("Method Not Allowed");
 
   try {
-    const trace = crypto.randomBytes(6).toString("hex"); // simples trace id
-    const raw = await readRawBody(req);
+    // No Vercel, o body já vem parseado; usamos JSON.stringify para recompor o raw.
+    const rawBody = JSON.stringify(req.body || {});
+    const evt = (req.body || {}) as any;
+    const eventType: string = String(evt?.type || "");
 
-    // tente ambos headers (legado e novo)
-    const sigHeader =
-      (req.headers["x-woovi-signature"] as string) ||
-      (req.headers["x-openpix-signature"] as string) ||
-      "";
+    const headerSig = (req.headers["x-woovi-signature"] as string) || "";
+    const secret = SECRET_BY_EVENT[eventType];
 
-    const provided = normalizeSig(sigHeader);
-
-    if (WEBHOOK_SECRET) {
-      const { hex, base64 } = computeHmac(raw, WEBHOOK_SECRET);
-      const ok = safeEqual(provided, hex) || safeEqual(provided, base64);
-      if (!ok) {
-        console.error("[woovi:webhook] invalid_signature", { trace, providedLen: provided.length });
-        return res.status(400).json({ ok: false, error: "invalid_signature", trace });
-      }
+    if (!eventType) {
+      return res.status(400).json({ ok:false, error:"missing_event_type" });
+    }
+    if (!secret) {
+      // Melhor falhar explicitamente quando não houver segredo mapeado
+      return res.status(400).json({ ok:false, error:"unconfigured_event_secret", eventType });
+    }
+    if (!headerSig) {
+      return res.status(400).json({ ok:false, error:"missing_signature_header" });
     }
 
-    // Só depois de validar, parseamos o JSON
-    let evt: any = {};
-    try {
-      evt = JSON.parse(raw.toString("utf8") || "{}");
-    } catch {
-      console.error("[woovi:webhook] bad_json", { trace });
-      return res.status(400).json({ ok: false, error: "invalid_json", trace });
+    const expected = sign(rawBody, secret);
+    if (!safeEqual(expected, headerSig)) {
+      return res.status(400).json({ ok:false, error:"invalid_signature" });
     }
 
-    // Logs resumidos/úteis:
-    const type = evt?.type || evt?.event || "unknown";
-    const data = evt?.data || {};
-    const correlationID =
-      data?.subscription?.correlationID ||
-      data?.correlationID ||
-      null;
-    const recurrencyId =
-      data?.pixRecurring?.recurrencyId ||
-      data?.recurrencyId ||
-      null;
-    const chargeId = data?.charge?.id || null;
+    // ✅ Assinatura ok – registre log mínimo e responda 200 rápido
+    console.log("[woovi:webhook] OK", { type: eventType, id: evt?.data?.id ?? null });
 
-    console.log("[woovi:webhook] recv", {
-      trace, type, correlationID, recurrencyId, chargeId,
-    });
+    // TODO: aqui você pode:
+    // - persistir em Supabase (woovi_webhooks)
+    // - atualizar assinaturas/pagamentos pelo correlationID
+    // - disparar repasse automático quando necessário
 
-    // TODO:
-    // - Persistir evt (ex.: tabela woovi_webhooks)
-    // - Atualizar subscriptions/charges por correlationID/recurrencyId/chargeId
-    // - Se for pagamento aprovado, disparar workflow de repasse
-
-    return res.status(200).json({ ok: true, trace });
+    return res.status(200).json({ ok: true });
   } catch (err: any) {
-    console.error("[woovi:webhook] fail", err?.message || err);
-    return res.status(500).json({ ok: false, error: "woovi_webhook_fail" });
+    console.error("woovi_webhook_fail", err?.response?.data || err?.message || err);
+    return res.status(500).json({ ok:false, error:"woovi_webhook_fail" });
   }
 }
