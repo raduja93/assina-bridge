@@ -46,8 +46,6 @@ const onlyDigits = (s: unknown) => String(s ?? "").replace(/\D/g, "");
 /** Converte reais (ex.: 55 ou "55.00") para centavos. Se já vier em centavos (value), use esse. */
 const toCents = (v: any) => {
   if (v == null || v === "") return NaN;
-  // se vier number inteiro grande (p.ex 5500) e o caller chamou de "valueReais" por engano,
-  // não tem como inferir; aqui tratamos valueReais COMO reais (55.00 => 5500).
   const n = Number(String(v).replace(",", "."));
   if (!isFinite(n) || n <= 0) return NaN;
   return Math.round(n * 100);
@@ -60,7 +58,6 @@ const toInt = (v: any) => {
 
 const dayFromISO = (s?: string) => {
   if (!s) return NaN;
-  // força meia-noite local pra evitar off-by-one em TZ
   const d = new Date(s + (s.length === 10 ? "T00:00:00" : ""));
   return isNaN(d.getTime()) ? NaN : d.getDate();
 };
@@ -106,21 +103,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const body = (req.body || {}) as any;
 
-    // Aceitamos dois formatos:
-    // 1) SIMPLIFICADO (front manda: planName, valueReais, dueDate, firstPaymentNow, correlationID, customer{name,taxID})
-    // 2) RAW (payload "nativo" Woovi; aqui só injetamos address se faltar)
+    // EXIGIR correlationID do front SEMPRE
+    const frontCID = typeof body.correlationID === "string" ? body.correlationID.trim() : "";
+    if (!frontCID) {
+      return res.status(400).json({
+        ok: false,
+        error: "missing_correlationID",
+        hint: "Envie correlationID (string não vazia) no payload do front."
+      });
+    }
+
+    // Dois formatos de entrada:
     const isSimplified =
       "planName" in body || "valueReais" in body || "dueDate" in body || "firstPaymentNow" in body;
 
     let payload: any;
 
     if (isSimplified) {
-      // correlationID pode vir pronto do front; se não vier, geramos com businessId opcional + taxID
-      const taxID = onlyDigits(body?.customer?.taxID);
-      const correlationID =
-        body.correlationID ||
-        `STORE-${(body.businessId || "unknown")}-${taxID || "NOCPF"}-${Date.now()}`;
-
       const customer = buildCustomer(body.customer);
       if (!customer) {
         return res.status(400).json({
@@ -129,7 +128,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
-      // valor: aceitar value (centavos) OU valueReais (R$)
+      // value em centavos OU valueReais (R$)
       let value: number | undefined;
       if (Number.isFinite(body.value) && Number(body.value) > 0) {
         value = Math.trunc(Number(body.value));
@@ -143,11 +142,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
-      // nome do plano
       const name = String(body.planName || body.name || "Assinatura Pix Automático").trim();
       if (!name) return res.status(400).json({ ok:false, error:"missing_name" });
 
-      // frequência, jornada e retry
       const frequency = body.frequency || "MONTHLY";
       const retryPolicy =
         body.retryPolicy ||
@@ -159,7 +156,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         (body.pixRecurringOptions?.journey as string) ||
         (firstPaymentNow ? "PAYMENT_ON_APPROVAL" : "ONLY_RECURRENCY");
 
-      // dia do mês: de dueDate (ISO) ou hoje se J3
+      // dia do mês
       let day = dayFromISO(body.dueDate);
       if (firstPaymentNow || !Number.isFinite(day)) {
         day = todayDayOfMonth();
@@ -169,7 +166,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         name,
         value,
         customer,
-        correlationID,
+        correlationID: frontCID, // <- usa EXATAMENTE o que veio do front
         comment: body.comment || "Assinatura via AssinaPix",
         frequency,
         type: "PIX_RECURRING",
@@ -178,9 +175,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         dayDue: day,
       };
     } else {
-      // RAW: só garantimos customer + address, e campos mínimos Woovi
-      const cust = buildCustomer(body.customer);
-      if (!cust) {
+      // RAW
+      const customer = buildCustomer(body.customer);
+      if (!customer) {
         return res.status(400).json({ ok:false, error:"missing_customer_fields" });
       }
 
@@ -194,11 +191,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       const name = String(body.name || "Assinatura Pix Automático").trim();
       if (!name) return res.status(400).json({ ok:false, error:"missing_name" });
-
-      const taxID = onlyDigits(body?.customer?.taxID);
-      const correlationID =
-        body.correlationID ||
-        `STORE-${(body.businessId || "unknown")}-${taxID || "NOCPF"}-${Date.now()}`;
 
       const frequency = body.frequency || "MONTHLY";
       const retryPolicy =
@@ -214,8 +206,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       payload = {
         name,
         value,
-        customer: cust,
-        correlationID,
+        customer,
+        correlationID: frontCID, // <- usa EXATAMENTE o que veio do front
         comment: body.comment || "Assinatura via AssinaPix",
         frequency,
         type: body.type || "PIX_RECURRING",
@@ -225,7 +217,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       };
     }
 
-    // Idempotency por correlationID (se vier do front, respeitamos)
+    // Idempotency por correlationID vindo do front
     const idemKey = (req.headers["idempotency-key"] as string) || `subs-${payload.correlationID}`;
 
     // CHAMADA: token cru nos dois headers (sem "Bearer")
@@ -240,7 +232,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const resp = { ok:true, data:r.data };
     if (debugEcho) {
-      return res.status(200).json({ ...resp, _debug: { sentPayload: payload } });
+      return res.status(200).json({ ...resp, _debug: { sentPayload: payload, idemKey } });
     }
     return res.status(200).json(resp);
   } catch (err:any) {
