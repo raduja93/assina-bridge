@@ -2,11 +2,11 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import axios from "axios";
 
-/** ===== Config ===== */
-const WOOVI_BASE = (process.env.WOOVI_API_BASE || "https://api.woovi.com/api/v1").replace(/\/+$/, "");
-const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN || process.env.WOOVI_APP_ID;
+/** ====== Config ====== */
+const WOOVI_BASE = (process.env.WOOVI_API_BASE || "https://api.woovi.com/api/v1").replace(/\/+$/,"");
+const WOOVI_API_TOKEN = process.env.WOOVI_API_TOKEN || process.env.WOOVI_APP_ID; // compat
 
-/** ===== CORS ===== */
+/** ====== CORS ====== */
 function setCors(req: VercelRequest, res: VercelResponse) {
   const o = (req.headers.origin as string) || "";
   if (
@@ -21,42 +21,68 @@ function setCors(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key");
 }
 
-/** ===== Handler ===== */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
 
   if (!WOOVI_API_TOKEN) {
-    return res.status(500).json({ ok: false, error: "missing_api_token" });
+    return res.status(500).json({ ok:false, error:"missing_api_token" });
   }
 
-  try {
-    // Aceita query params: start, end, customer, charge, status, page, limit
-    const { start, end, customer, charge, status, page, limit } = req.query;
+  // paginação simples
+  const limit = Number(req.query.limit ?? 100);
+  const skip  = Number(req.query.skip  ?? 0);
 
-    const r = await axios.get(`${WOOVI_BASE}/transactions`, {
-      headers: {
-        Authorization: WOOVI_API_TOKEN as string,
-        "X-Api-Key": WOOVI_API_TOKEN as string,
-        "Content-Type": "application/json",
-      },
-      params: {
-        start,
-        end,
-        customer,
-        charge,
-        status,
-        page,
-        limit,
-      },
-    });
+  // candidates conhecidos/possíveis (ordem de tentativa)
+  const candidates = [
+    `${WOOVI_BASE}/transactions?limit=${encodeURIComponent(String(limit))}&skip=${encodeURIComponent(String(skip))}`,
+    `${WOOVI_BASE}/transaction?limit=${encodeURIComponent(String(limit))}&skip=${encodeURIComponent(String(skip))}`,
+    `${WOOVI_BASE}/pix/transactions?limit=${encodeURIComponent(String(limit))}&skip=${encodeURIComponent(String(skip))}`,
+  ];
 
-    return res.status(200).json({ ok: true, data: r.data });
-  } catch (err: any) {
-    const status = err?.response?.status || 500;
-    const detail = err?.response?.data || { message: err?.message || "unknown_error" };
-    console.error("woovi_transactions_list_fail", status, detail);
-    return res.status(status).json({ ok: false, error: "woovi_transactions_list_fail", detail });
+  const headers = {
+    Authorization: WOOVI_API_TOKEN as string,
+    "X-Api-Key":   WOOVI_API_TOKEN as string,
+  };
+
+  let lastErr: any = null;
+
+  for (const url of candidates) {
+    try {
+      const r = await axios.get(url, { headers });
+      // padroniza saída (alinha com subscriptions-list)
+      return res.status(200).json({
+        ok: true,
+        data: r.data,
+        tried: [url],
+      });
+    } catch (e: any) {
+      lastErr = {
+        status: e?.response?.status || 0,
+        data: e?.response?.data ?? e?.message ?? String(e),
+        url,
+      };
+      // se não for 404, provavelmente a rota existe mas deu outro erro → já retorna
+      if (lastErr.status && lastErr.status !== 404) {
+        return res.status(lastErr.status).json({
+          ok:false,
+          error:"woovi_transactions_list_fail",
+          detail:lastErr,
+        });
+      }
+      // se foi 404, continua tentando o próximo candidate
+    }
   }
+
+  // se chegou aqui, todas as tentativas deram 404
+  return res.status(404).json({
+    ok:false,
+    error:"woovi_transactions_list_fail",
+    detail:{
+      message:"All candidate endpoints returned 404",
+      tried: candidates,
+      lastError: lastErr,
+    }
+  });
 }
