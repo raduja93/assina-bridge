@@ -58,11 +58,22 @@ const toInt = (v: any) => {
 
 const dayFromISO = (s?: string) => {
   if (!s) return NaN;
-  const d = new Date(s + (s.length === 10 ? "T00:00:00" : ""));
-  return isNaN(d.getTime()) ? NaN : d.getDate();
+  const d = new Date(s.length === 10 ? `${s}T00:00:00` : s);
+  if (isNaN(d.getTime())) return NaN;
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    day: "2-digit",
+  });
+  return Number(fmt.format(d));
 };
 
-const todayDayOfMonth = () => Number(new Date().toISOString().slice(8,10)); // 1..31
+const todayDayOfMonth = (now: Date = new Date()) => {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    day: "2-digit",
+  });
+  return Number(fmt.format(now));
+};
 
 function ensureAddress(addr: any) {
   const a = addr && typeof addr === "object" ? addr : {};
