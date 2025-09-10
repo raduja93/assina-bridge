@@ -157,10 +157,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         (firstPaymentNow ? "PAYMENT_ON_APPROVAL" : "ONLY_RECURRENCY");
 
       // dia do mês
-      let day = dayFromISO(body.dueDate);
-      if (firstPaymentNow || !Number.isFinite(day)) {
-        day = todayDayOfMonth();
-      }
+      // NOVO: usa o que veio do front
+const dayFromFront = toInt(body.dayGenerateCharge);
+const dayFromDueDate = dayFromISO(body.dueDate);
+
+// prioridade: dayGenerateCharge -> dueDate -> hoje
+const day = Number.isFinite(dayFromFront)
+  ? (dayFromFront as number)
+  : (Number.isFinite(dayFromDueDate) ? (dayFromDueDate as number) : todayDayOfMonth());
 
       payload = {
         name,
