@@ -56,24 +56,28 @@ const toInt = (v: any) => {
   return Number.isFinite(n) ? Math.trunc(n) : undefined;
 };
 
-const dayFromISO = (s?: string) => {
+/** Dia do mês "hoje" em America/Sao_Paulo (1..31) */
+const todayDayOfMonthSP = (now: Date = new Date()) => {
+  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Sao_Paulo", day: "2-digit" });
+  return Number(fmt.format(now));
+};
+
+/** Extrai o dia do mês de uma data respeitando America/Sao_Paulo */
+const dayFromISO_SP = (s?: string) => {
   if (!s) return NaN;
   const d = new Date(s.length === 10 ? `${s}T00:00:00` : s);
   if (isNaN(d.getTime())) return NaN;
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Sao_Paulo",
-    day: "2-digit",
-  });
+  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Sao_Paulo", day: "2-digit" });
   return Number(fmt.format(d));
 };
 
-const todayDayOfMonth = (now: Date = new Date()) => {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Sao_Paulo",
-    day: "2-digit",
-  });
-  return Number(fmt.format(now));
-};
+/** Normaliza journey para o formato esperado pela Woovi */
+function normalizeJourney(input?: string, firstPaymentNow?: boolean): "only_recurrency" | "page_on_approval" {
+  const s = String(input || "").trim().toLowerCase();
+  if (s === "page_on_approval" || s === "pay_on_approval" || s === "payment_on_approval") return "page_on_approval";
+  if (s === "only_recurrency" || s === "only_recurring" || s === "onlyrecurrency") return "only_recurrency";
+  return firstPaymentNow ? "page_on_approval" : "only_recurrency";
+}
 
 function ensureAddress(addr: any) {
   const a = addr && typeof addr === "object" ? addr : {};
@@ -163,14 +167,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         "NON_PERMITED";
 
       const firstPaymentNow = !!body.firstPaymentNow;
-      const journey =
-        (body.pixRecurringOptions?.journey as string) ||
-        (firstPaymentNow ? "PAYMENT_ON_APPROVAL" : "ONLY_RECURRENCY");
 
-      // dia do mês
-      let day = dayFromISO(body.dueDate);
-      if (firstPaymentNow || !Number.isFinite(day)) {
-        day = todayDayOfMonth();
+      // journey em snake_case esperado pela Woovi
+      const journey = normalizeJourney(body.pixRecurringOptions?.journey, firstPaymentNow);
+
+      // dia do mês, seguindo a regra da jornada
+      let genDay: number;
+      let dueDay: number;
+
+      if (journey === "page_on_approval") {
+        // regra Woovi: dayGenerateCharge TEM que ser hoje (SP)
+        genDay = todayDayOfMonthSP();
+        dueDay = genDay;
+      } else {
+        // only_recurrency: tenta usar dueDate; se não vier, usa hoje (SP)
+        const fromDue = dayFromISO_SP(body.dueDate);
+        genDay = Number.isFinite(fromDue) ? fromDue : todayDayOfMonthSP();
+
+        const rawDue = Number(body.dayDue);
+        dueDay = Number.isFinite(rawDue) ? Math.trunc(rawDue) : genDay;
       }
 
       payload = {
@@ -182,9 +197,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         frequency,
         type: "PIX_RECURRING",
         pixRecurringOptions: { journey, retryPolicy },
-        dayGenerateCharge: day,
-        dayDue: day,
+        dayGenerateCharge: genDay,
+        dayDue: dueDay,
       };
+
+      console.log("🧭 Woovi rec payload check (simplified)", {
+        journey,
+        genDay,
+        dueDay,
+        nowSP: todayDayOfMonthSP(),
+        dueDateFromFront: body.dueDate
+      });
+
     } else {
       // RAW
       const customer = buildCustomer(body.customer);
@@ -203,16 +227,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const name = String(body.name || "Assinatura Pix Automático").trim();
       if (!name) return res.status(400).json({ ok:false, error:"missing_name" });
 
-      const frequency = body.frequency || "MONTHLY";
-      const retryPolicy =
-        body.retryPolicy ||
-        body.pixRecurringOptions?.retryPolicy ||
-        "NON_PERMITED";
-      const journey =
-        body.pixRecurringOptions?.journey || "ONLY_RECURRENCY";
+      const frequency   = body.frequency || "MONTHLY";
+      const retryPolicy = body.retryPolicy || body.pixRecurringOptions?.retryPolicy || "NON_PERMITED";
+      const journey     = normalizeJourney(body.pixRecurringOptions?.journey, /*firstPaymentNow*/ false);
 
-      const dayGen = toInt(body.dayGenerateCharge) ?? todayDayOfMonth();
-      const dayDue = toInt(body.dayDue) ?? dayGen;
+      let genDay: number;
+      let dueDay: number;
+
+      if (journey === "page_on_approval") {
+        genDay = todayDayOfMonthSP();
+        dueDay = genDay;
+      } else {
+        const requestedGen = toInt(body.dayGenerateCharge);
+        if (Number.isFinite(requestedGen!)) {
+          genDay = requestedGen!;
+        } else {
+          const fromDue = dayFromISO_SP(body.dueDate);
+          genDay = Number.isFinite(fromDue) ? fromDue : todayDayOfMonthSP();
+        }
+        const requestedDue = toInt(body.dayDue);
+        dueDay = Number.isFinite(requestedDue!) ? requestedDue! : genDay;
+      }
 
       payload = {
         name,
@@ -223,9 +258,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         frequency,
         type: body.type || "PIX_RECURRING",
         pixRecurringOptions: { journey, retryPolicy },
-        dayGenerateCharge: dayGen,
-        dayDue,
+        dayGenerateCharge: genDay,
+        dayDue: dueDay,
       };
+
+      console.log("🧭 Woovi rec payload check (raw)", {
+        journey,
+        genDay,
+        dueDay,
+        nowSP: todayDayOfMonthSP(),
+        dueDateFromFront: body.dueDate,
+        dayGenerateChargeFromFront: body.dayGenerateCharge,
+        dayDueFromFront: body.dayDue
+      });
     }
 
     // Idempotency por correlationID vindo do front
@@ -246,6 +291,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({ ...resp, _debug: { sentPayload: payload, idemKey } });
     }
     return res.status(200).json(resp);
+
   } catch (err:any) {
     const status = err?.response?.status || 500;
     const detail = err?.response?.data || { message: err?.message || "unknown_error" };
